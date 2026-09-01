@@ -1,0 +1,38 @@
+apiVersion: rbac.authorization.k8s.io/v1
+{{- if .Values.rbac.namespaced }}
+kind: Role
+{{- else }}
+kind: ClusterRole
+{{- end }}
+metadata:
+{{- if .Values.rbac.namespaced }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+  name: {{ include "release-operator.resourceName" (dict "suffix" "manager-role" "context" $) }}
+rules:
+- apiGroups:
+  - platform.taskapp.io
+  resources:
+  - releases
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - platform.taskapp.io
+  resources:
+  - releases/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - platform.taskapp.io
+  resources:
+  - releases/status
+  verbs:
+  - get
+  - patch
+  - update

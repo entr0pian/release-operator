@@ -6,6 +6,10 @@ cliVersion: 4.14.0
 domain: taskapp.io
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v2-alpha:
+    manifests: dist/install.yaml
+    output: .
 projectName: release-operator
 repo: github.com/entr0pian/release-operator
 resources:
