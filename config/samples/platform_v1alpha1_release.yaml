@@ -11,3 +11,7 @@ spec:
     name: checkout
   environment: management
   version: 4602f5c24671261337f19b56cea7004d58dd8a2d
+  bindings:
+    database:
+      enabled: true
+      ref: checkout-db
