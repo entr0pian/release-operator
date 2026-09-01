@@ -13,6 +13,14 @@ rules:
 - apiGroups:
   - platform.taskapp.io
   resources:
+  - components
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - platform.taskapp.io
+  resources:
   - releases
   verbs:
   - create

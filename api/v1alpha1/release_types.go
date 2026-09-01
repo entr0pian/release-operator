@@ -34,10 +34,7 @@ type ComponentReference struct {
 }
 
 // DatabaseBinding declares whether the database runtime binding is enabled
-// for this Release, and which Database resource to resolve its connection
-// Secret from. See RUNTIME_DEPENDENCIES.md's Database Connection Secret
-// Contract for the resolution chain this backs
-// (ref -> Database CR -> status.connectionSecretRef -> values secretName).
+// for this Release, and which Database resource it belongs to.
 type DatabaseBinding struct {
 	// enabled turns the database binding on for this environment. The
 	// scaffolded chart always ships with database support present but
@@ -45,10 +42,8 @@ type DatabaseBinding struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// ref names the Database CR, in the same namespace as this Release, to
-	// resolve the connection Secret from. Required when enabled is true;
-	// the controller must resolve it via Database.status.connectionSecretRef
-	// and never reconstruct the Secret name from ref itself.
+	// ref names the Database CR this binding's connection Secret belongs
+	// to. Required when enabled is true.
 	// +optional
 	Ref string `json:"ref,omitempty"`
 }

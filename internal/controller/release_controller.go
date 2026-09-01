@@ -17,9 +17,19 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -27,31 +37,222 @@ import (
 	platformv1alpha1 "github.com/entr0pian/release-operator/api/v1alpha1"
 )
 
+const (
+	// credentialsSecretName/Namespace mirror scaffold-operator's own
+	// githubClientFor: the same shared Secret Crossplane's GitHub provider
+	// already reads, rather than a second GitHub credential this operator
+	// would have to be issued and rotated separately.
+	credentialsSecretName      = "crossplane-github-credentials"
+	credentialsSecretNamespace = "crossplane-system"
+
+	// applicationRepositoriesRepo is the one repository this controller
+	// ever writes to — unlike scaffold-operator, which writes into
+	// whichever repo a ScaffoldRequest names.
+	applicationRepositoriesRepo = "application-repositories"
+	applicationRepositoriesRef  = "main"
+
+	readyConditionType = "Ready"
+)
+
+// componentGVK is read as unstructured, not as a typed Go struct: Component
+// (component-operator) is owned by a different repository, and importing
+// its types here would recreate exactly the cross-project coupling
+// componentRef is meant to avoid — the same reason backend-operator reads
+// AtlasSchema (also foreign, db.atlasgo.io) as unstructured rather than
+// vendoring ariga's types.
+var componentGVK = schema.GroupVersionKind{Group: "platform.taskapp.io", Version: "v1alpha1", Kind: "Component"}
+
 // ReleaseReconciler reconciles a Release object
 type ReleaseReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// NewGitHubClient overrides how a githubClient is constructed from a
+	// token, for tests. Defaults to newGoGithubClient.
+	NewGitHubClient func(token string) githubClient
 }
 
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=releases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=releases/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=releases/finalizers,verbs=update
+// +kubebuilder:rbac:groups=platform.taskapp.io,resources=components,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Release object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
+// Reconcile resolves a Release's componentRef and bindings into
+// components/<component>/{environments,values}/<environment>.yaml in
+// application-repositories, and commits both atomically — see
+// RUNTIME_DEPENDENCIES.md's "Release CR" / "GitOps file layout" sections.
 //
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
+// Release, the Database CRs it references, and the workload's own namespace
+// are all assumed to be the same namespace (release.Namespace) — the same
+// convention Database already follows (its connection Secret lands in "the
+// workload's own namespace"). Component is looked up in that same namespace
+// too. This is a simplifying assumption for a single-cluster validation
+// pass, not something RUNTIME_DEPENDENCIES.md pins down; it becomes a real
+// question once Release needs to reference a Component that only exists on
+// a different cluster than the one Release itself is reconciled on.
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	release := &platformv1alpha1.Release{}
+	if err := r.Get(ctx, req.NamespacedName, release); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
-	return ctrl.Result{}, nil
+	repoURL, ready, err := r.resolveComponent(ctx, release)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
+	}
+
+	secretName, ready := r.resolveDatabaseBinding(release)
+	if !ready {
+		return ctrl.Result{}, r.Status().Update(ctx, release)
+	}
+
+	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	valuesContent, err := buildValuesFile(release, secretName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.syncToGitOps(ctx, release, envContent, valuesContent); err != nil {
+		r.setReady(release, metav1.ConditionFalse, "SyncFailed", err.Error())
+		_ = r.Status().Update(ctx, release)
+		return ctrl.Result{}, err
+	}
+
+	log.Info("release synced", "component", release.Spec.ComponentRef.Name, "environment", release.Spec.Environment)
+	r.setReady(release, metav1.ConditionTrue, "Synced", "wrote environments/values to application-repositories")
+	release.Status.ObservedGeneration = release.Generation
+	return ctrl.Result{}, r.Status().Update(ctx, release)
+}
+
+// resolveComponent GETs the referenced Component and returns the git-clone
+// repoURL derived from its status.repository.url (the HTML URL, "+.git" —
+// see PLATFORM_API_ARCHITECTURE.md / component_types.go's RepositoryStatus).
+// ready=false means the condition was set and the caller should requeue,
+// not treat this as an error.
+func (r *ReleaseReconciler) resolveComponent(ctx context.Context, release *platformv1alpha1.Release) (repoURL string, ready bool, err error) {
+	component := &unstructured.Unstructured{}
+	component.SetGroupVersionKind(componentGVK)
+	name := release.Spec.ComponentRef.Name
+	if getErr := r.Get(ctx, types.NamespacedName{Name: name, Namespace: release.Namespace}, component); getErr != nil {
+		if client.IgnoreNotFound(getErr) != nil {
+			return "", false, fmt.Errorf("getting Component/%s: %w", name, getErr)
+		}
+		r.setReady(release, metav1.ConditionFalse, "ComponentNotFound", fmt.Sprintf("Component/%s not found in namespace %s", name, release.Namespace))
+		return "", false, nil
+	}
+
+	htmlURL, found, _ := unstructured.NestedString(component.Object, "status", "repository", "url")
+	if !found || htmlURL == "" {
+		r.setReady(release, metav1.ConditionFalse, "ComponentRepositoryNotReady", fmt.Sprintf("Component/%s status.repository.url not set yet", name))
+		return "", false, nil
+	}
+
+	return htmlURL + ".git", true, nil
+}
+
+// resolveDatabaseBinding resolves spec.bindings.database, if enabled, into
+// the Secret name components/<component>/values/<env>.yaml should carry.
+// Returns "" unchanged when the binding isn't declared/enabled.
+func (r *ReleaseReconciler) resolveDatabaseBinding(release *platformv1alpha1.Release) (secretName string, ready bool) {
+	db := release.Spec.Bindings.Database
+	if db == nil || !db.Enabled {
+		return "", true
+	}
+	if db.Ref == "" {
+		r.setReady(release, metav1.ConditionFalse, "InvalidSpec", "bindings.database.enabled is true but ref is empty")
+		return "", false
+	}
+
+	return fmt.Sprintf("%s-database-connection-details", db.Ref), true
+}
+
+// syncToGitOps commits envContent/valuesContent into application-repositories
+// as one atomic commit, skipping entirely if both files already match.
+func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv1alpha1.Release, envContent, valuesContent []byte) error {
+	gh, owner, err := r.githubClientFor(ctx)
+	if err != nil {
+		return err
+	}
+
+	envPath := environmentsFilePath(release.Spec.ComponentRef.Name, release.Spec.Environment)
+	valuesPath := valuesFilePath(release.Spec.ComponentRef.Name, release.Spec.Environment)
+
+	files := map[string][]byte{}
+	for path, desired := range map[string][]byte{envPath: envContent, valuesPath: valuesContent} {
+		current, found, err := gh.GetFileContent(ctx, owner, applicationRepositoriesRepo, path, applicationRepositoriesRef)
+		if err != nil {
+			return fmt.Errorf("reading current %s: %w", path, err)
+		}
+		if !found || !bytes.Equal(current, desired) {
+			files[path] = desired
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+
+	headSHA, treeSHA, err := gh.GetBranchHead(ctx, owner, applicationRepositoriesRepo, applicationRepositoriesRef)
+	if err != nil {
+		return fmt.Errorf("reading %s head: %w", applicationRepositoriesRepo, err)
+	}
+
+	message := fmt.Sprintf("Release %s: sync %s/%s", release.Name, release.Spec.ComponentRef.Name, release.Spec.Environment)
+	if _, err := gh.CommitFiles(ctx, owner, applicationRepositoriesRepo, applicationRepositoriesRef, message, files, headSHA, treeSHA); err != nil {
+		return fmt.Errorf("committing to %s: %w", applicationRepositoriesRepo, err)
+	}
+	return nil
+}
+
+// githubCredentials mirrors the single "credentials" key on the
+// crossplane-github-credentials Secret — a JSON blob, not separate Secret
+// keys (same shape scaffold-operator already reads).
+type githubCredentials struct {
+	Token string `json:"token"`
+	Owner string `json:"owner"`
+}
+
+// githubClientFor reads the shared crossplane-github-credentials Secret via
+// a direct client.Get (Secrets don't mount cross-namespace) and returns a
+// GitHub client plus the account/org this cluster's automation writes as.
+func (r *ReleaseReconciler) githubClientFor(ctx context.Context) (githubClient, string, error) {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: credentialsSecretName, Namespace: credentialsSecretNamespace}, secret); err != nil {
+		return nil, "", fmt.Errorf("reading %s/%s credentials secret: %w", credentialsSecretNamespace, credentialsSecretName, err)
+	}
+
+	raw, ok := secret.Data["credentials"]
+	if !ok {
+		return nil, "", fmt.Errorf("%s/%s secret has no \"credentials\" key", credentialsSecretNamespace, credentialsSecretName)
+	}
+
+	var creds githubCredentials
+	if err := json.Unmarshal(raw, &creds); err != nil {
+		return nil, "", fmt.Errorf("parsing %s/%s credentials: %w", credentialsSecretNamespace, credentialsSecretName, err)
+	}
+
+	newClient := r.NewGitHubClient
+	if newClient == nil {
+		newClient = newGoGithubClient
+	}
+	return newClient(creds.Token), creds.Owner, nil
+}
+
+func (r *ReleaseReconciler) setReady(release *platformv1alpha1.Release, status metav1.ConditionStatus, reason, message string) {
+	apimeta.SetStatusCondition(&release.Status.Conditions, metav1.Condition{
+		Type:               readyConditionType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: release.Generation,
+	})
 }
 
 // SetupWithManager sets up the controller with the Manager.

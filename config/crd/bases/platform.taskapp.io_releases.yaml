@@ -55,10 +55,8 @@ spec:
                         type: boolean
                       ref:
                         description: |-
-                          ref names the Database CR, in the same namespace as this Release, to
-                          resolve the connection Secret from. Required when enabled is true;
-                          the controller must resolve it via Database.status.connectionSecretRef
-                          and never reconstruct the Secret name from ref itself.
+                          ref names the Database CR this binding's connection Secret belongs
+                          to. Required when enabled is true.
                         type: string
                     type: object
                 type: object
