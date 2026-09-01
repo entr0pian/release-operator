@@ -39,10 +39,54 @@ spec:
           spec:
             description: spec defines the desired state of Release
             properties:
-              foo:
-                description: foo is an example field of Release. Edit release_types.go
-                  to remove/update
+              bindings:
+                description: |-
+                  bindings declares which runtime dependencies are enabled for this
+                  component/environment, and which resource to resolve each from.
+                properties:
+                  database:
+                    description: database binding — see DatabaseBinding.
+                    properties:
+                      enabled:
+                        description: |-
+                          enabled turns the database binding on for this environment. The
+                          scaffolded chart always ships with database support present but
+                          disabled — this is what flips it on, per environment.
+                        type: boolean
+                      ref:
+                        description: |-
+                          ref names the Database CR, in the same namespace as this Release, to
+                          resolve the connection Secret from. Required when enabled is true;
+                          the controller must resolve it via Database.status.connectionSecretRef
+                          and never reconstruct the Secret name from ref itself.
+                        type: string
+                    type: object
+                type: object
+              componentRef:
+                description: componentRef is the authoritative reference to the owning
+                  Component.
+                properties:
+                  name:
+                    description: name of the Component this resource belongs to.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              environment:
+                description: |-
+                  environment this Release targets, e.g. "dev" or "prod" — must match
+                  one of ArgoCD's registered clusters' environment label.
+                minLength: 1
                 type: string
+              version:
+                description: version is the component's image tag to deploy.
+                minLength: 1
+                type: string
+            required:
+            - componentRef
+            - environment
+            - version
             type: object
           status:
             description: status defines the observed state of Release
@@ -116,6 +160,12 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedGeneration:
+                description: |-
+                  observedGeneration is the most recent spec generation the controller
+                  has reconciled.
+                format: int64
+                type: integer
             type: object
         required:
         - spec

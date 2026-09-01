@@ -23,25 +23,75 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// ComponentReference is the authoritative link from a related resource back
+// to its owning Component, per PLATFORM_API_ARCHITECTURE.md's componentRef
+// pattern — reused here exactly as GitHubRepository and Database already do.
+type ComponentReference struct {
+	// name of the Component this resource belongs to.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// DatabaseBinding declares whether the database runtime binding is enabled
+// for this Release, and which Database resource to resolve its connection
+// Secret from. See RUNTIME_DEPENDENCIES.md's Database Connection Secret
+// Contract for the resolution chain this backs
+// (ref -> Database CR -> status.connectionSecretRef -> values secretName).
+type DatabaseBinding struct {
+	// enabled turns the database binding on for this environment. The
+	// scaffolded chart always ships with database support present but
+	// disabled — this is what flips it on, per environment.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// ref names the Database CR, in the same namespace as this Release, to
+	// resolve the connection Secret from. Required when enabled is true;
+	// the controller must resolve it via Database.status.connectionSecretRef
+	// and never reconstruct the Secret name from ref itself.
+	// +optional
+	Ref string `json:"ref,omitempty"`
+}
+
+// ReleaseBindings declares this Release's runtime dependency bindings. Each
+// binding type is its own typed field, not a generic map — deliberately, so
+// each binding's resolution logic and Secret key contract stays explicit and
+// reviewable per binding rather than dispatched from an arbitrary string.
+type ReleaseBindings struct {
+	// database binding — see DatabaseBinding.
+	// +optional
+	Database *DatabaseBinding `json:"database,omitempty"`
+}
+
 // ReleaseSpec defines the desired state of Release
 type ReleaseSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	// componentRef is the authoritative reference to the owning Component.
+	// +required
+	ComponentRef ComponentReference `json:"componentRef"`
 
-	// foo is an example field of Release. Edit release_types.go to remove/update
+	// environment this Release targets, e.g. "dev" or "prod" — must match
+	// one of ArgoCD's registered clusters' environment label.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Environment string `json:"environment"`
+
+	// version is the component's image tag to deploy.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Version string `json:"version"`
+
+	// bindings declares which runtime dependencies are enabled for this
+	// component/environment, and which resource to resolve each from.
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	Bindings ReleaseBindings `json:"bindings,omitempty"`
 }
 
 // ReleaseStatus defines the observed state of Release.
 type ReleaseStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+	// observedGeneration is the most recent spec generation the controller
+	// has reconciled.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// conditions represent the current state of the Release resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.

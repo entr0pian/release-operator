@@ -4,6 +4,14 @@ metadata:
   labels:
     app.kubernetes.io/name: release-operator
     app.kubernetes.io/managed-by: kustomize
-  name: release-sample
+    platform.taskapp.io/component: payments
+  name: payments-management
 spec:
-  # TODO(user): Add fields here
+  componentRef:
+    name: payments
+  environment: management
+  version: 41769607a44bfdab927e56d1ac89024e4b822cf3
+  bindings:
+    database:
+      enabled: true
+      ref: payments-db
