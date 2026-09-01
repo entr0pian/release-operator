@@ -4,14 +4,10 @@ metadata:
   labels:
     app.kubernetes.io/name: release-operator
     app.kubernetes.io/managed-by: kustomize
-    platform.taskapp.io/component: payments
-  name: payments-management
+    platform.taskapp.io/component: checkout
+  name: checkout-management
 spec:
   componentRef:
-    name: payments
+    name: checkout
   environment: management
-  version: 41769607a44bfdab927e56d1ac89024e4b822cf3
-  bindings:
-    database:
-      enabled: true
-      ref: payments-db
+  version: 4602f5c24671261337f19b56cea7004d58dd8a2d

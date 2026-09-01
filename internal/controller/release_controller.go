@@ -67,6 +67,14 @@ type ReleaseReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
+	// APIReader is a direct, uncached read from the API server
+	// (mgr.GetAPIReader()) — used only for the crossplane-github-credentials
+	// Secret. The cached client.Client lazily starts a cluster-wide
+	// list/watch informer the first time any type is Get'd through it,
+	// which this operator's RBAC (deliberately narrow: get on one named
+	// Secret) doesn't grant. APIReader needs only "get".
+	APIReader client.Reader
+
 	// NewGitHubClient overrides how a githubClient is constructed from a
 	// token, for tests. Defaults to newGoGithubClient.
 	NewGitHubClient func(token string) githubClient
@@ -224,7 +232,7 @@ type githubCredentials struct {
 // GitHub client plus the account/org this cluster's automation writes as.
 func (r *ReleaseReconciler) githubClientFor(ctx context.Context) (githubClient, string, error) {
 	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Name: credentialsSecretName, Namespace: credentialsSecretNamespace}, secret); err != nil {
+	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: credentialsSecretName, Namespace: credentialsSecretNamespace}, secret); err != nil {
 		return nil, "", fmt.Errorf("reading %s/%s credentials secret: %w", credentialsSecretNamespace, credentialsSecretName, err)
 	}
 
