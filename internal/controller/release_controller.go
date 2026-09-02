@@ -219,7 +219,7 @@ func (r *ReleaseReconciler) resolveDatabaseBinding(ctx context.Context, release 
 
 	secretRefNamespace, _, _ := unstructured.NestedString(database.Object, "status", "connectionSecretRef", "namespace")
 	if secretRefNamespace != "" && secretRefNamespace != release.Namespace {
-		return "", false, fmt.Errorf("Database/%s status.connectionSecretRef.namespace %q does not match Release namespace %q", db.Ref, secretRefNamespace, release.Namespace)
+		return "", false, fmt.Errorf("database/%s status.connectionSecretRef.namespace %q does not match release namespace %q", db.Ref, secretRefNamespace, release.Namespace)
 	}
 
 	return secretRefName, true, nil
