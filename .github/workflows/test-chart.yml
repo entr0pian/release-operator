@@ -50,6 +50,10 @@ jobs:
         run: |
           helm lint ./chart
 
+      - name: Create crossplane-system namespace
+        run: |
+          kubectl create namespace crossplane-system
+
 # TODO: Uncomment if cert-manager is enabled
 #      - name: Install cert-manager via Helm (wait for readiness)
 #        run: |
