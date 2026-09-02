@@ -62,6 +62,11 @@ const (
 // vendoring ariga's types.
 var componentGVK = schema.GroupVersionKind{Group: "platform.taskapp.io", Version: "v1alpha1", Kind: "Component"}
 
+// databaseGVK is read as unstructured for the same reason as componentGVK:
+// Database is a Crossplane composite resource owned by crossplane-compositions
+// (apis/database), not a type this repository should vendor.
+var databaseGVK = schema.GroupVersionKind{Group: "database.taskapp.io", Version: "v1alpha1", Kind: "Database"}
+
 // ReleaseReconciler reconciles a Release object
 type ReleaseReconciler struct {
 	client.Client
@@ -84,6 +89,7 @@ type ReleaseReconciler struct {
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=releases/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=releases/finalizers,verbs=update
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=components,verbs=get;list;watch
+// +kubebuilder:rbac:groups=database.taskapp.io,resources=databases,verbs=get;list;watch
 
 // Reconcile resolves a Release's componentRef and bindings into
 // components/<component>/{environments,values}/<environment>.yaml in
@@ -114,9 +120,14 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
 	}
 
-	secretName, ready := r.resolveDatabaseBinding(release)
+	secretName, ready, err := r.resolveDatabaseBinding(ctx, release)
+	if err != nil {
+		r.setReady(release, metav1.ConditionFalse, "DatabaseBindingInvalid", err.Error())
+		_ = r.Status().Update(ctx, release)
+		return ctrl.Result{}, err
+	}
 	if !ready {
-		return ctrl.Result{}, r.Status().Update(ctx, release)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
 	}
 
 	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL)
@@ -169,17 +180,49 @@ func (r *ReleaseReconciler) resolveComponent(ctx context.Context, release *platf
 // resolveDatabaseBinding resolves spec.bindings.database, if enabled, into
 // the Secret name components/<component>/values/<env>.yaml should carry.
 // Returns "" unchanged when the binding isn't declared/enabled.
-func (r *ReleaseReconciler) resolveDatabaseBinding(release *platformv1alpha1.Release) (secretName string, ready bool) {
+//
+// Per RUNTIME_DEPENDENCIES.md's "Release CR" section, this is a lookup
+// chain through the Database CR's own status, never a string transform —
+// ref: payments-db and its connection Secret's name are deliberately
+// unrelated strings, so the Secret name must be read from
+// Database.status.connectionSecretRef, not reconstructed from db.Ref.
+// ready=false means the condition was set and the caller should requeue,
+// not treat this as an error. A namespace mismatch between
+// connectionSecretRef and this Release is a hard error, not a not-ready
+// state — per the same section, a Secret outside the workload's own
+// namespace can never actually resolve at runtime.
+func (r *ReleaseReconciler) resolveDatabaseBinding(ctx context.Context, release *platformv1alpha1.Release) (secretName string, ready bool, err error) {
 	db := release.Spec.Bindings.Database
 	if db == nil || !db.Enabled {
-		return "", true
+		return "", true, nil
 	}
 	if db.Ref == "" {
 		r.setReady(release, metav1.ConditionFalse, "InvalidSpec", "bindings.database.enabled is true but ref is empty")
-		return "", false
+		return "", false, nil
 	}
 
-	return fmt.Sprintf("%s-database-connection-details", db.Ref), true
+	database := &unstructured.Unstructured{}
+	database.SetGroupVersionKind(databaseGVK)
+	if getErr := r.Get(ctx, types.NamespacedName{Name: db.Ref, Namespace: release.Namespace}, database); getErr != nil {
+		if client.IgnoreNotFound(getErr) != nil {
+			return "", false, fmt.Errorf("getting Database/%s: %w", db.Ref, getErr)
+		}
+		r.setReady(release, metav1.ConditionFalse, "DatabaseNotFound", fmt.Sprintf("Database/%s not found in namespace %s", db.Ref, release.Namespace))
+		return "", false, nil
+	}
+
+	secretRefName, found, _ := unstructured.NestedString(database.Object, "status", "connectionSecretRef", "name")
+	if !found || secretRefName == "" {
+		r.setReady(release, metav1.ConditionFalse, "DatabaseSecretNotReady", fmt.Sprintf("Database/%s status.connectionSecretRef not set yet", db.Ref))
+		return "", false, nil
+	}
+
+	secretRefNamespace, _, _ := unstructured.NestedString(database.Object, "status", "connectionSecretRef", "namespace")
+	if secretRefNamespace != "" && secretRefNamespace != release.Namespace {
+		return "", false, fmt.Errorf("Database/%s status.connectionSecretRef.namespace %q does not match Release namespace %q", db.Ref, secretRefNamespace, release.Namespace)
+	}
+
+	return secretRefName, true, nil
 }
 
 // syncToGitOps commits envContent/valuesContent into application-repositories

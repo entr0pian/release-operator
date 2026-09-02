@@ -11,6 +11,14 @@ metadata:
   name: {{ include "release-operator.resourceName" (dict "suffix" "manager-role" "context" $) }}
 rules:
 - apiGroups:
+  - database.taskapp.io
+  resources:
+  - databases
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - platform.taskapp.io
   resources:
   - components
