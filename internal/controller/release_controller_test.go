@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -88,6 +89,76 @@ var _ = Describe("Release Controller", func() {
 			cond := findReadyCondition(updated)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Reason).To(Equal("ComponentNotFound"))
+		})
+	})
+
+	Context("resolveComponent", func() {
+		const releaseNS = "dev"
+
+		ctx := context.Background()
+		reconciler := &ReleaseReconciler{}
+
+		BeforeEach(func() {
+			reconciler.Client = k8sClient
+			reconciler.Scheme = k8sClient.Scheme()
+
+			for _, ns := range []string{releaseNS, componentNamespace} {
+				err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
+				if err != nil && !errors.IsAlreadyExists(err) {
+					Expect(err).NotTo(HaveOccurred())
+				}
+			}
+		})
+
+		AfterEach(func() {
+			list := &unstructured.UnstructuredList{}
+			list.SetGroupVersionKind(componentGVK)
+			Expect(k8sClient.List(ctx, list, client.InNamespace(componentNamespace))).To(Succeed())
+			for i := range list.Items {
+				Expect(k8sClient.Delete(ctx, &list.Items[i])).To(Succeed())
+			}
+		})
+
+		newRelease := func(name string) *platformv1alpha1.Release {
+			return &platformv1alpha1.Release{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: releaseNS},
+				Spec: platformv1alpha1.ReleaseSpec{
+					ComponentRef: platformv1alpha1.ComponentReference{Name: "checkout"},
+					Environment:  "dev",
+					Version:      "1.0.0",
+				},
+			}
+		}
+
+		It("is not ready, with no error, when no Component exists in componentNamespace", func() {
+			release := newRelease("missing-component")
+			_, ready, err := reconciler.resolveComponent(ctx, release)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeFalse())
+		})
+
+		It("resolves a Component from componentNamespace even though the Release lives in a different namespace", func() {
+			component := &unstructured.Unstructured{}
+			component.SetGroupVersionKind(componentGVK)
+			component.SetName("checkout")
+			component.SetNamespace(componentNamespace)
+			Expect(unstructured.SetNestedMap(component.Object, map[string]any{
+				"owner":      "checkout-team",
+				"repository": map[string]any{},
+			}, "spec")).To(Succeed())
+			Expect(k8sClient.Create(ctx, component)).To(Succeed())
+
+			Expect(unstructured.SetNestedMap(component.Object, map[string]any{
+				"url":   "https://github.com/entr0pian/checkout",
+				"ready": true,
+			}, "status", "repository")).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, component)).To(Succeed())
+
+			release := newRelease("ready-component")
+			repoURL, ready, err := reconciler.resolveComponent(ctx, release)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeTrue())
+			Expect(repoURL).To(Equal("https://github.com/entr0pian/checkout.git"))
 		})
 	})
 

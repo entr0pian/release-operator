@@ -51,6 +51,16 @@ const (
 	applicationRepositoriesRepo = "application-repositories"
 	applicationRepositoriesRef  = "main"
 
+	// componentNamespace is the single, fixed namespace every Component
+	// lives in, regardless of which namespace the Releases referencing it
+	// are in. Component is a global identity (one GitHub repo, one scaffold
+	// status) shared across every environment, so — unlike Database, which
+	// is genuinely per-environment and therefore looked up in
+	// release.Namespace — it must never be resolved relative to the
+	// Release doing the looking up, or the same Component would need to be
+	// duplicated into every environment namespace.
+	componentNamespace = "component"
+
 	readyConditionType = "Ready"
 )
 
@@ -99,11 +109,11 @@ type ReleaseReconciler struct {
 // Release, the Database CRs it references, and the workload's own namespace
 // are all assumed to be the same namespace (release.Namespace) — the same
 // convention Database already follows (its connection Secret lands in "the
-// workload's own namespace"). Component is looked up in that same namespace
-// too. This is a simplifying assumption for a single-cluster validation
-// pass, not something RUNTIME_DEPENDENCIES.md pins down; it becomes a real
-// question once Release needs to reference a Component that only exists on
-// a different cluster than the one Release itself is reconciled on.
+// workload's own namespace"), and typically one namespace per environment
+// (e.g. "dev", "prod"). Component is the one exception: it's a single
+// cross-environment identity, not a per-environment resource, so it's
+// always resolved from the fixed componentNamespace instead — see
+// resolveComponent.
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -151,20 +161,23 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, r.Status().Update(ctx, release)
 }
 
-// resolveComponent GETs the referenced Component and returns the git-clone
-// repoURL derived from its status.repository.url (the HTML URL, "+.git" —
-// see PLATFORM_API_ARCHITECTURE.md / component_types.go's RepositoryStatus).
+// resolveComponent GETs the referenced Component — always from the fixed
+// componentNamespace, never release.Namespace, since Component is a single
+// identity shared across every environment rather than a per-environment
+// resource — and returns the git-clone repoURL derived from its
+// status.repository.url (the HTML URL, "+.git" — see
+// PLATFORM_API_ARCHITECTURE.md / component_types.go's RepositoryStatus).
 // ready=false means the condition was set and the caller should requeue,
 // not treat this as an error.
 func (r *ReleaseReconciler) resolveComponent(ctx context.Context, release *platformv1alpha1.Release) (repoURL string, ready bool, err error) {
 	component := &unstructured.Unstructured{}
 	component.SetGroupVersionKind(componentGVK)
 	name := release.Spec.ComponentRef.Name
-	if getErr := r.Get(ctx, types.NamespacedName{Name: name, Namespace: release.Namespace}, component); getErr != nil {
+	if getErr := r.Get(ctx, types.NamespacedName{Name: name, Namespace: componentNamespace}, component); getErr != nil {
 		if client.IgnoreNotFound(getErr) != nil {
 			return "", false, fmt.Errorf("getting Component/%s: %w", name, getErr)
 		}
-		r.setReady(release, metav1.ConditionFalse, "ComponentNotFound", fmt.Sprintf("Component/%s not found in namespace %s", name, release.Namespace))
+		r.setReady(release, metav1.ConditionFalse, "ComponentNotFound", fmt.Sprintf("Component/%s not found in namespace %s", name, componentNamespace))
 		return "", false, nil
 	}
 

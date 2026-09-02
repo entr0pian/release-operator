@@ -5,11 +5,11 @@ metadata:
     app.kubernetes.io/name: release-operator
     app.kubernetes.io/managed-by: kustomize
     platform.taskapp.io/component: checkout
-  name: checkout-management
+  name: checkout-dev
 spec:
   componentRef:
     name: checkout
-  environment: management
+  environment: dev
   version: 4602f5c24671261337f19b56cea7004d58dd8a2d
   bindings:
     database:
