@@ -59,7 +59,7 @@ const (
 	// release.Namespace — it must never be resolved relative to the
 	// Release doing the looking up, or the same Component would need to be
 	// duplicated into every environment namespace.
-	componentNamespace = "component"
+	componentNamespace = "platform"
 
 	readyConditionType = "Ready"
 )
