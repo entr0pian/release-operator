@@ -200,6 +200,21 @@ var _ = Describe("Release Controller", func() {
 			return database
 		}
 
+		setConnectionExport := func(ctx context.Context, database *unstructured.Unstructured, ready bool, provider, key string) {
+			Expect(unstructured.SetNestedSlice(database.Object, []interface{}{
+				map[string]interface{}{
+					"name":  "connection",
+					"type":  "Secret",
+					"ready": ready,
+					"location": map[string]interface{}{
+						"provider": provider,
+						"key":      key,
+					},
+				},
+			}, "status", "exports")).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, database)).To(Succeed())
+		}
+
 		AfterEach(func() {
 			list := &unstructured.UnstructuredList{}
 			list.SetGroupVersionKind(databaseGVK)
@@ -209,20 +224,20 @@ var _ = Describe("Release Controller", func() {
 			}
 		})
 
-		It("returns ready with no secret when the binding isn't declared", func() {
+		It("returns ready with no binding when the binding isn't declared", func() {
 			release := newRelease("no-binding", nil)
-			secretName, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
+			resolved, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ready).To(BeTrue())
-			Expect(secretName).To(BeEmpty())
+			Expect(resolved).To(Equal(resolvedDatabaseBinding{}))
 		})
 
-		It("returns ready with no secret when the binding is disabled", func() {
+		It("returns ready with no binding when the binding is disabled", func() {
 			release := newRelease("disabled-binding", &platformv1alpha1.DatabaseBinding{Enabled: false})
-			secretName, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
+			resolved, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ready).To(BeTrue())
-			Expect(secretName).To(BeEmpty())
+			Expect(resolved).To(Equal(resolvedDatabaseBinding{}))
 		})
 
 		It("is not ready, with no error, when enabled but ref is empty", func() {
@@ -239,7 +254,7 @@ var _ = Describe("Release Controller", func() {
 			Expect(ready).To(BeFalse())
 		})
 
-		It("is not ready, with no error, when the Database hasn't published a connectionSecretRef yet", func() {
+		It("is not ready, with no error, when the Database hasn't published a connection export yet", func() {
 			createDatabase("checkout-db")
 			release := newRelease("pending-db", &platformv1alpha1.DatabaseBinding{Enabled: true, Ref: "checkout-db"})
 			_, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
@@ -247,32 +262,39 @@ var _ = Describe("Release Controller", func() {
 			Expect(ready).To(BeFalse())
 		})
 
-		It("resolves the actual Secret name from status.connectionSecretRef, not a naming convention", func() {
+		It("is not ready, with no error, when the connection export exists but isn't ready", func() {
 			database := createDatabase("checkout-db")
-			Expect(unstructured.SetNestedMap(database.Object, map[string]any{
-				"name":      "checkout-db-connection",
-				"namespace": ns,
-			}, "status", "connectionSecretRef")).To(Succeed())
-			Expect(k8sClient.Status().Update(ctx, database)).To(Succeed())
+			setConnectionExport(ctx, database, false, "AWSSecretsManager", "/bindings/dev/databases/checkout-db")
 
-			release := newRelease("ready-db", &platformv1alpha1.DatabaseBinding{Enabled: true, Ref: "checkout-db"})
-			secretName, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
+			release := newRelease("export-not-ready", &platformv1alpha1.DatabaseBinding{Enabled: true, Ref: "checkout-db"})
+			_, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(ready).To(BeTrue())
-			Expect(secretName).To(Equal("checkout-db-connection"))
+			Expect(ready).To(BeFalse())
 		})
 
-		It("errors when connectionSecretRef.namespace doesn't match the Release's namespace", func() {
+		It("is not ready, with no error, when the export provider is unsupported", func() {
 			database := createDatabase("checkout-db")
-			Expect(unstructured.SetNestedMap(database.Object, map[string]any{
-				"name":      "checkout-db-connection",
-				"namespace": "some-other-namespace",
-			}, "status", "connectionSecretRef")).To(Succeed())
-			Expect(k8sClient.Status().Update(ctx, database)).To(Succeed())
+			setConnectionExport(ctx, database, true, "GCPSecretManager", "/bindings/dev/databases/checkout-db")
 
-			release := newRelease("mismatched-namespace-db", &platformv1alpha1.DatabaseBinding{Enabled: true, Ref: "checkout-db"})
-			_, _, err := reconciler.resolveDatabaseBinding(ctx, release)
-			Expect(err).To(HaveOccurred())
+			release := newRelease("unsupported-provider", &platformv1alpha1.DatabaseBinding{Enabled: true, Ref: "checkout-db"})
+			_, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeFalse())
+		})
+
+		It("resolves type/provider/remoteRef from status.exports, not a naming convention", func() {
+			database := createDatabase("checkout-db")
+			setConnectionExport(ctx, database, true, "AWSSecretsManager", "/bindings/dev/databases/checkout-db")
+
+			release := newRelease("ready-db", &platformv1alpha1.DatabaseBinding{Enabled: true, Ref: "checkout-db"})
+			resolved, ready, err := reconciler.resolveDatabaseBinding(ctx, release)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ready).To(BeTrue())
+			Expect(resolved).To(Equal(resolvedDatabaseBinding{
+				Type:      "secret",
+				Provider:  "aws-secrets-manager",
+				RemoteRef: "/bindings/dev/databases/checkout-db",
+			}))
 		})
 	})
 })

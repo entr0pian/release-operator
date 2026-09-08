@@ -62,6 +62,23 @@ const (
 	componentNamespace = "platform"
 
 	readyConditionType = "Ready"
+
+	// exportNameConnection is the one Database export name this controller
+	// resolves — Database v1 always publishes its connection bundle under
+	// this fixed export name.
+	exportNameConnection = "connection"
+	exportTypeSecret     = "Secret"
+
+	// awsSecretsManagerExportProvider is the only status.exports[].location.provider
+	// value this controller currently understands how to translate into a
+	// generic workload binding — see genericProviderFor.
+	awsSecretsManagerExportProvider = "AWSSecretsManager"
+
+	// genericBindingTypeSecret/genericProviderAWSSecretsManager are the
+	// values.yaml-facing vocabulary the workload chart consumes, never the
+	// Database-specific "AWSSecretsManager" export enum above.
+	genericBindingTypeSecret         = "secret"
+	genericProviderAWSSecretsManager = "aws-secrets-manager"
 )
 
 // componentGVK is read as unstructured, not as a typed Go struct: Component
@@ -130,7 +147,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
 	}
 
-	secretName, ready, err := r.resolveDatabaseBinding(ctx, release)
+	dbBinding, ready, err := r.resolveDatabaseBinding(ctx, release)
 	if err != nil {
 		r.setReady(release, metav1.ConditionFalse, "DatabaseBindingInvalid", err.Error())
 		_ = r.Status().Update(ctx, release)
@@ -144,7 +161,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	valuesContent, err := buildValuesFile(release, secretName)
+	valuesContent, err := buildValuesFile(release, dbBinding)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -190,52 +207,128 @@ func (r *ReleaseReconciler) resolveComponent(ctx context.Context, release *platf
 	return htmlURL + ".git", true, nil
 }
 
+// resolvedDatabaseBinding is the generic secret-binding info the Release
+// controller resolves from a Database's status.exports entry. Zero value
+// means "no binding declared/enabled".
+type resolvedDatabaseBinding struct {
+	Type      string
+	Provider  string
+	RemoteRef string
+}
+
 // resolveDatabaseBinding resolves spec.bindings.database, if enabled, into
-// the Secret name components/<component>/values/<env>.yaml should carry.
-// Returns "" unchanged when the binding isn't declared/enabled.
+// the generic secret-binding info components/<component>/values/<env>.yaml
+// should carry. Returns the zero value when the binding isn't
+// declared/enabled.
 //
-// Per RUNTIME_DEPENDENCIES.md's "Release CR" section, this is a lookup
-// chain through the Database CR's own status, never a string transform —
-// ref: payments-db and its connection Secret's name are deliberately
-// unrelated strings, so the Secret name must be read from
-// Database.status.connectionSecretRef, not reconstructed from db.Ref.
-// ready=false means the condition was set and the caller should requeue,
-// not treat this as an error. A namespace mismatch between
-// connectionSecretRef and this Release is a hard error, not a not-ready
-// state — per the same section, a Secret outside the workload's own
-// namespace can never actually resolve at runtime.
-func (r *ReleaseReconciler) resolveDatabaseBinding(ctx context.Context, release *platformv1alpha1.Release) (secretName string, ready bool, err error) {
+// This reads the Database's public export contract (status.exports), never
+// status.connectionSecretRef (an internal, same-cluster implementation
+// detail) — the export contract is what lets Release and Database live on
+// different clusters. ready=false means the condition was set and the
+// caller should requeue, not treat this as an error: Database not
+// existing, its export missing, not yet ready, or naming an unsupported
+// provider are all normal reconciling states, not failures of this
+// controller.
+func (r *ReleaseReconciler) resolveDatabaseBinding(ctx context.Context, release *platformv1alpha1.Release) (resolvedDatabaseBinding, bool, error) {
 	db := release.Spec.Bindings.Database
 	if db == nil || !db.Enabled {
-		return "", true, nil
+		return resolvedDatabaseBinding{}, true, nil
 	}
 	if db.Ref == "" {
 		r.setReady(release, metav1.ConditionFalse, "InvalidSpec", "bindings.database.enabled is true but ref is empty")
-		return "", false, nil
+		return resolvedDatabaseBinding{}, false, nil
 	}
 
 	database := &unstructured.Unstructured{}
 	database.SetGroupVersionKind(databaseGVK)
 	if getErr := r.Get(ctx, types.NamespacedName{Name: db.Ref, Namespace: release.Namespace}, database); getErr != nil {
 		if client.IgnoreNotFound(getErr) != nil {
-			return "", false, fmt.Errorf("getting Database/%s: %w", db.Ref, getErr)
+			return resolvedDatabaseBinding{}, false, fmt.Errorf("getting Database/%s: %w", db.Ref, getErr)
 		}
 		r.setReady(release, metav1.ConditionFalse, "DatabaseNotFound", fmt.Sprintf("Database/%s not found in namespace %s", db.Ref, release.Namespace))
-		return "", false, nil
+		return resolvedDatabaseBinding{}, false, nil
 	}
 
-	secretRefName, found, _ := unstructured.NestedString(database.Object, "status", "connectionSecretRef", "name")
-	if !found || secretRefName == "" {
-		r.setReady(release, metav1.ConditionFalse, "DatabaseSecretNotReady", fmt.Sprintf("Database/%s status.connectionSecretRef not set yet", db.Ref))
-		return "", false, nil
+	export, found := findExport(database, exportNameConnection)
+	if !found {
+		r.setReady(release, metav1.ConditionFalse, "ExportMissing", fmt.Sprintf("Database/%s has no %q export in status.exports", db.Ref, exportNameConnection))
+		return resolvedDatabaseBinding{}, false, nil
 	}
 
-	secretRefNamespace, _, _ := unstructured.NestedString(database.Object, "status", "connectionSecretRef", "namespace")
-	if secretRefNamespace != "" && secretRefNamespace != release.Namespace {
-		return "", false, fmt.Errorf("database/%s status.connectionSecretRef.namespace %q does not match release namespace %q", db.Ref, secretRefNamespace, release.Namespace)
+	if export.exportType != exportTypeSecret {
+		r.setReady(release, metav1.ConditionFalse, "ExportTypeUnsupported", fmt.Sprintf("Database/%s connection export has type %q, expected %q", db.Ref, export.exportType, exportTypeSecret))
+		return resolvedDatabaseBinding{}, false, nil
 	}
 
-	return secretRefName, true, nil
+	if !export.ready {
+		r.setReady(release, metav1.ConditionFalse, "ExportNotReady", fmt.Sprintf("Database/%s connection export is not ready yet", db.Ref))
+		return resolvedDatabaseBinding{}, false, nil
+	}
+
+	provider, ok := genericProviderFor(export.provider)
+	if !ok {
+		r.setReady(release, metav1.ConditionFalse, "ExportProviderUnsupported", fmt.Sprintf("Database/%s connection export provider %q is not supported", db.Ref, export.provider))
+		return resolvedDatabaseBinding{}, false, nil
+	}
+
+	if export.key == "" {
+		r.setReady(release, metav1.ConditionFalse, "ExportNotReady", fmt.Sprintf("Database/%s connection export has no location.key set", db.Ref))
+		return resolvedDatabaseBinding{}, false, nil
+	}
+
+	return resolvedDatabaseBinding{
+		Type:      genericBindingTypeSecret,
+		Provider:  provider,
+		RemoteRef: export.key,
+	}, true, nil
+}
+
+// databaseExport is one status.exports[] entry, read as plain data — see
+// findExport.
+type databaseExport struct {
+	exportType string
+	ready      bool
+	provider   string
+	key        string
+}
+
+// findExport returns the status.exports[] entry with the given name.
+// status.exports is a list, not a map, so this is a linear scan rather
+// than a direct field lookup.
+func findExport(database *unstructured.Unstructured, name string) (databaseExport, bool) {
+	exports, found, _ := unstructured.NestedSlice(database.Object, "status", "exports")
+	if !found {
+		return databaseExport{}, false
+	}
+	for _, raw := range exports {
+		entry, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if entryName, _, _ := unstructured.NestedString(entry, "name"); entryName != name {
+			continue
+		}
+		exportType, _, _ := unstructured.NestedString(entry, "type")
+		ready, _, _ := unstructured.NestedBool(entry, "ready")
+		provider, _, _ := unstructured.NestedString(entry, "location", "provider")
+		key, _, _ := unstructured.NestedString(entry, "location", "key")
+		return databaseExport{exportType: exportType, ready: ready, provider: provider, key: key}, true
+	}
+	return databaseExport{}, false
+}
+
+// genericProviderFor translates a Database export's location.provider enum
+// into the generic values.yaml provider slug the workload chart
+// understands. Unsupported providers are reported by the caller as an
+// explicit condition rather than passed through, since an unrecognized
+// provider means the chart has no template that could ever consume it.
+func genericProviderFor(exportProvider string) (string, bool) {
+	switch exportProvider {
+	case awsSecretsManagerExportProvider:
+		return genericProviderAWSSecretsManager, true
+	default:
+		return "", false
+	}
 }
 
 // syncToGitOps commits envContent/valuesContent into application-repositories

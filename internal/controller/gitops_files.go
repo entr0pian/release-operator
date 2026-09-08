@@ -54,16 +54,23 @@ type sourceFields struct {
 // valuesFile is components/<component>/values/<env>.yaml.
 type valuesFile struct {
 	Image    imageFields     `yaml:"image"`
-	Database *databaseValues `yaml:"database,omitempty"`
+	Bindings *bindingsValues `yaml:"bindings,omitempty"`
 }
 
 type imageFields struct {
 	Tag string `yaml:"tag"`
 }
 
-type databaseValues struct {
-	Enabled    bool   `yaml:"enabled"`
-	SecretName string `yaml:"secretName"`
+// bindingsValues is the generic runtime-binding block: the chart only ever
+// sees type/provider/remoteRef, never that this came from a Database CR.
+type bindingsValues struct {
+	Database *databaseBindingValues `yaml:"database,omitempty"`
+}
+
+type databaseBindingValues struct {
+	Type      string `yaml:"type"`
+	Provider  string `yaml:"provider"`
+	RemoteRef string `yaml:"remoteRef"`
 }
 
 // buildEnvironmentsFile renders components/<component>/environments/<env>.yaml.
@@ -83,12 +90,17 @@ func buildEnvironmentsFile(release *platformv1alpha1.Release, namespace, repoURL
 	})
 }
 
-// buildValuesFile renders components/<component>/values/<env>.yaml.
-// secretName is the empty string when the database binding isn't enabled.
-func buildValuesFile(release *platformv1alpha1.Release, secretName string) ([]byte, error) {
+// buildValuesFile renders components/<component>/values/<env>.yaml. db is
+// the zero value when the database binding isn't declared/enabled, in
+// which case no bindings key is emitted at all.
+func buildValuesFile(release *platformv1alpha1.Release, db resolvedDatabaseBinding) ([]byte, error) {
 	vf := valuesFile{Image: imageFields{Tag: release.Spec.Version}}
-	if db := release.Spec.Bindings.Database; db != nil {
-		vf.Database = &databaseValues{Enabled: db.Enabled, SecretName: secretName}
+	if db.RemoteRef != "" {
+		vf.Bindings = &bindingsValues{Database: &databaseBindingValues{
+			Type:      db.Type,
+			Provider:  db.Provider,
+			RemoteRef: db.RemoteRef,
+		}}
 	}
 	return marshalYAML(vf)
 }
