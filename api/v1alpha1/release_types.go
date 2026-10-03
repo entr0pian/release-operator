@@ -70,7 +70,10 @@ type ReleaseSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Environment string `json:"environment"`
 
-	// version is the component's image tag to deploy.
+	// version is the commit of the component's repository to deploy: used
+	// both as the image tag and as the revision the chart is read from, so
+	// it must be a git ref whose image exists (CI tags images with the full
+	// commit SHA).
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	Version string `json:"version"`

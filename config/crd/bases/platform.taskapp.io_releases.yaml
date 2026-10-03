@@ -78,7 +78,11 @@ spec:
                 minLength: 1
                 type: string
               version:
-                description: version is the component's image tag to deploy.
+                description: |-
+                  version is the commit of the component's repository to deploy: used
+                  both as the image tag and as the revision the chart is read from, so
+                  it must be a git ref whose image exists (CI tags images with the full
+                  commit SHA).
                 minLength: 1
                 type: string
             required:

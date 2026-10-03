@@ -24,14 +24,11 @@ import (
 	platformv1alpha1 "github.com/entr0pian/release-operator/api/v1alpha1"
 )
 
-// defaultTargetRevision and defaultChartPath are hardcoded for now.
-// RUNTIME_DEPENDENCIES.md's design has these come from the Component's own
-// chart metadata eventually; today Component only exposes
-// status.repository.url, so these two stay fixed until that's extended.
-const (
-	defaultTargetRevision = "main"
-	defaultChartPath      = "chart"
-)
+// defaultChartPath is hardcoded for now. RUNTIME_DEPENDENCIES.md's design
+// has it come from the Component's own chart metadata eventually; today
+// Component only exposes status.repository.url, so it stays fixed until
+// that's extended.
+const defaultChartPath = "chart"
 
 // environmentsFile is components/<component>/environments/<env>.yaml.
 // Field order matters here — this is marshaled with yaml.v3, which
@@ -83,8 +80,12 @@ func buildEnvironmentsFile(release *platformv1alpha1.Release, namespace, repoURL
 		Environment: release.Spec.Environment,
 		Namespace:   namespace,
 		Source: sourceFields{
-			RepoURL:        repoURL,
-			TargetRevision: defaultTargetRevision,
+			RepoURL: repoURL,
+			// Same commit as the image tag (buildValuesFile), so the chart and
+			// the code always deploy, and roll back, together. Tracking "main"
+			// instead would roll out every chart push against whatever image
+			// the Release last pinned.
+			TargetRevision: release.Spec.Version,
 			ChartPath:      defaultChartPath,
 		},
 	})
