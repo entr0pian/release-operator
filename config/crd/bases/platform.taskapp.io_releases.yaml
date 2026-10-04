@@ -39,6 +39,18 @@ spec:
           spec:
             description: spec defines the desired state of Release
             properties:
+              autoDeploy:
+                description: |-
+                  autoDeploy, when enabled, deploys the latest successful CI build on the
+                  component's main branch instead of a pinned version — see AutoDeploySpec.
+                properties:
+                  enabled:
+                    description: |-
+                      enabled turns auto-deploy on. Mutually exclusive with spec.version, and
+                      only honoured in the environments the operator is started with
+                      (--auto-deploy-environments, "dev" by default).
+                    type: boolean
+                type: object
               bindings:
                 description: |-
                   bindings declares which runtime dependencies are enabled for this
@@ -82,17 +94,43 @@ spec:
                   version is the commit of the component's repository to deploy: used
                   both as the image tag and as the revision the chart is read from, so
                   it must be a git ref whose image exists (CI tags images with the full
-                  commit SHA).
+                  commit SHA). Required unless autoDeploy.enabled is true, in which case
+                  it must be left unset: the operator picks the version itself.
                 minLength: 1
                 type: string
             required:
             - componentRef
             - environment
-            - version
             type: object
+            x-kubernetes-validations:
+            - message: set exactly one of version or autoDeploy.enabled
+              rule: (has(self.version) && size(self.version) > 0) != (has(self.autoDeploy)
+                && has(self.autoDeploy.enabled) && self.autoDeploy.enabled)
           status:
             description: status defines the observed state of Release
             properties:
+              autoDeploy:
+                description: autoDeploy is set while spec.autoDeploy is enabled —
+                  see AutoDeployStatus.
+                properties:
+                  deployedAt:
+                    description: deployedAt is when deployedVersion was written.
+                    format: date-time
+                    type: string
+                  deployedVersion:
+                    description: deployedVersion is the commit SHA last written to
+                      application-repositories.
+                    type: string
+                  runNumber:
+                    description: |-
+                      runNumber is the CI workflow run that built deployedVersion. Auto-deploy
+                      only ever moves to a higher run number, never back.
+                    format: int64
+                    type: integer
+                  runURL:
+                    description: runURL links to that CI run.
+                    type: string
+                type: object
               conditions:
                 description: |-
                   conditions represent the current state of the Release resource.

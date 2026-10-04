@@ -48,6 +48,18 @@ type githubClient interface {
 	// every other file in the repo is preserved untouched), and moves
 	// branch's ref to it. Returns the new commit's SHA.
 	CommitFiles(ctx context.Context, owner, repo, branch, message string, files map[string][]byte, parentSHA, baseTreeSHA string) (string, error)
+
+	// LatestSuccessfulRun returns the newest successful run of workflowFile
+	// triggered by a push to branch, or nil if there is none yet (including
+	// when the workflow file doesn't exist). Only auto-deploy calls this.
+	LatestSuccessfulRun(ctx context.Context, owner, repo, workflowFile, branch string) (*workflowRun, error)
+}
+
+// workflowRun is the part of a GitHub Actions run auto-deploy needs.
+type workflowRun struct {
+	HeadSHA   string
+	RunNumber int64
+	HTMLURL   string
 }
 
 // goGithubClient is githubClient backed by a real GitHub API token.
@@ -125,6 +137,34 @@ func (c *goGithubClient) CommitFiles(ctx context.Context, owner, repo, branch, m
 	}
 
 	return commit.GetSHA(), nil
+}
+
+func (c *goGithubClient) LatestSuccessfulRun(ctx context.Context, owner, repo, workflowFile, branch string) (*workflowRun, error) {
+	// Same query as Backstage's DeployableVersionReader (the Create
+	// deployment Version picker), so auto-deploy and a person picking a
+	// version agree on what "deployable" means. A push run on main only
+	// succeeds once its push-image job has pushed the SHA-tagged image.
+	runs, _, err := c.gh.Actions.ListWorkflowRunsByFileName(ctx, owner, repo, workflowFile, &github.ListWorkflowRunsOptions{
+		Branch:      branch,
+		Event:       "push",
+		Status:      "success",
+		ListOptions: github.ListOptions{PerPage: 1},
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing %s runs on %s/%s: %w", workflowFile, owner, repo, err)
+	}
+	if len(runs.WorkflowRuns) == 0 {
+		return nil, nil
+	}
+	run := runs.WorkflowRuns[0]
+	return &workflowRun{
+		HeadSHA:   run.GetHeadSHA(),
+		RunNumber: int64(run.GetRunNumber()),
+		HTMLURL:   run.GetHTMLURL(),
+	}, nil
 }
 
 func isNotFound(err error) bool {

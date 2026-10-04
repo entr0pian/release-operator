@@ -58,7 +58,19 @@ type ReleaseBindings struct {
 	Database *DatabaseBinding `json:"database,omitempty"`
 }
 
+// AutoDeploySpec makes a Release follow its component's main branch instead
+// of a pinned version: every successful CI run on main is deployed as it
+// lands, with no PR per deploy.
+type AutoDeploySpec struct {
+	// enabled turns auto-deploy on. Mutually exclusive with spec.version, and
+	// only honoured in the environments the operator is started with
+	// (--auto-deploy-environments, "dev" by default).
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+}
+
 // ReleaseSpec defines the desired state of Release
+// +kubebuilder:validation:XValidation:rule="(has(self.version) && size(self.version) > 0) != (has(self.autoDeploy) && has(self.autoDeploy.enabled) && self.autoDeploy.enabled)",message="set exactly one of version or autoDeploy.enabled"
 type ReleaseSpec struct {
 	// componentRef is the authoritative reference to the owning Component.
 	// +required
@@ -73,15 +85,43 @@ type ReleaseSpec struct {
 	// version is the commit of the component's repository to deploy: used
 	// both as the image tag and as the revision the chart is read from, so
 	// it must be a git ref whose image exists (CI tags images with the full
-	// commit SHA).
-	// +required
+	// commit SHA). Required unless autoDeploy.enabled is true, in which case
+	// it must be left unset: the operator picks the version itself.
+	// +optional
 	// +kubebuilder:validation:MinLength=1
-	Version string `json:"version"`
+	Version string `json:"version,omitempty"`
+
+	// autoDeploy, when enabled, deploys the latest successful CI build on the
+	// component's main branch instead of a pinned version — see AutoDeploySpec.
+	// +optional
+	AutoDeploy *AutoDeploySpec `json:"autoDeploy,omitempty"`
 
 	// bindings declares which runtime dependencies are enabled for this
 	// component/environment, and which resource to resolve each from.
 	// +optional
 	Bindings ReleaseBindings `json:"bindings,omitempty"`
+}
+
+// AutoDeployStatus records what auto-deploy last deployed. It lives in status,
+// never spec: the Release manifest is applied from git by Argo CD, so writing
+// the version back into spec would be reverted (or left OutOfSync).
+type AutoDeployStatus struct {
+	// deployedVersion is the commit SHA last written to application-repositories.
+	// +optional
+	DeployedVersion string `json:"deployedVersion,omitempty"`
+
+	// runNumber is the CI workflow run that built deployedVersion. Auto-deploy
+	// only ever moves to a higher run number, never back.
+	// +optional
+	RunNumber int64 `json:"runNumber,omitempty"`
+
+	// runURL links to that CI run.
+	// +optional
+	RunURL string `json:"runURL,omitempty"`
+
+	// deployedAt is when deployedVersion was written.
+	// +optional
+	DeployedAt *metav1.Time `json:"deployedAt,omitempty"`
 }
 
 // ReleaseStatus defines the observed state of Release.
@@ -104,6 +144,10 @@ type ReleaseStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// autoDeploy is set while spec.autoDeploy is enabled — see AutoDeployStatus.
+	// +optional
+	AutoDeploy *AutoDeployStatus `json:"autoDeploy,omitempty"`
 }
 
 // +kubebuilder:object:root=true

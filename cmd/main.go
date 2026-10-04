@@ -20,6 +20,8 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -61,6 +63,8 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var autoDeployEnvironments string
+	var autoDeployPollInterval time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -79,6 +83,11 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&autoDeployEnvironments, "auto-deploy-environments",
+		strings.Join(controller.DefaultAutoDeployEnvironments, ","),
+		"Comma-separated environments a Release may enable spec.autoDeploy in. Releases elsewhere are refused.")
+	flag.DurationVar(&autoDeployPollInterval, "auto-deploy-poll-interval", controller.DefaultAutoDeployPollInterval,
+		"How often an auto-deploy Release checks GitHub for a newer successful CI run.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -182,6 +191,9 @@ func main() {
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		APIReader: mgr.GetAPIReader(),
+
+		AutoDeployEnvironments: splitList(autoDeployEnvironments),
+		AutoDeployPollInterval: autoDeployPollInterval,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "release")
 		os.Exit(1)
@@ -202,4 +214,15 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// splitList parses a comma-separated flag value, dropping empty entries.
+func splitList(value string) []string {
+	items := []string{}
+	for item := range strings.SplitSeq(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }

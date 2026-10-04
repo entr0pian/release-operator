@@ -74,7 +74,9 @@ type databaseBindingValues struct {
 // namespace is the Release's own namespace — see release_controller.go's
 // doc comment on why Release, its Database, and the deployed workload all
 // share one namespace per environment.
-func buildEnvironmentsFile(release *platformv1alpha1.Release, namespace, repoURL string) ([]byte, error) {
+// version is the resolved commit to deploy — spec.version for a pinned
+// Release, the latest CI build for an auto-deploy one.
+func buildEnvironmentsFile(release *platformv1alpha1.Release, namespace, repoURL, version string) ([]byte, error) {
 	return marshalYAML(environmentsFile{
 		Component:   release.Spec.ComponentRef.Name,
 		Environment: release.Spec.Environment,
@@ -85,7 +87,7 @@ func buildEnvironmentsFile(release *platformv1alpha1.Release, namespace, repoURL
 			// the code always deploy, and roll back, together. Tracking "main"
 			// instead would roll out every chart push against whatever image
 			// the Release last pinned.
-			TargetRevision: release.Spec.Version,
+			TargetRevision: version,
 			ChartPath:      defaultChartPath,
 		},
 	})
@@ -94,8 +96,8 @@ func buildEnvironmentsFile(release *platformv1alpha1.Release, namespace, repoURL
 // buildValuesFile renders components/<component>/values/<env>.yaml. db is
 // the zero value when the database binding isn't declared/enabled, in
 // which case no bindings key is emitted at all.
-func buildValuesFile(release *platformv1alpha1.Release, db resolvedDatabaseBinding) ([]byte, error) {
-	vf := valuesFile{Image: imageFields{Tag: release.Spec.Version}}
+func buildValuesFile(version string, db resolvedDatabaseBinding) ([]byte, error) {
+	vf := valuesFile{Image: imageFields{Tag: version}}
 	if db.RemoteRef != "" {
 		vf.Bindings = &bindingsValues{Database: &databaseBindingValues{
 			Type:      db.Type,

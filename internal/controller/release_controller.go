@@ -21,6 +21,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -79,7 +81,22 @@ const (
 	// Database-specific "AWSSecretsManager" export enum above.
 	genericBindingTypeSecret         = "secret"
 	genericProviderAWSSecretsManager = "aws-secrets-manager"
+
+	// ciWorkflowFile/ciBranch are what auto-deploy watches on a component's
+	// repository: the platform-scaffolds golang-service CI workflow, which
+	// builds and pushes the commit-SHA-tagged image on every push to main.
+	// Backstage's Version picker reads the same workflow.
+	ciWorkflowFile = "ci.yaml"
+	ciBranch       = "main"
+
+	// DefaultAutoDeployPollInterval is how often an auto-deploy Release
+	// checks for a newer successful CI run when none is configured.
+	DefaultAutoDeployPollInterval = 60 * time.Second
 )
+
+// DefaultAutoDeployEnvironments is where auto-deploy is allowed when the
+// reconciler isn't configured otherwise.
+var DefaultAutoDeployEnvironments = []string{"dev"}
 
 // componentGVK is read as unstructured, not as a typed Go struct: Component
 // (component-operator) is owned by a different repository, and importing
@@ -110,6 +127,17 @@ type ReleaseReconciler struct {
 	// NewGitHubClient overrides how a githubClient is constructed from a
 	// token, for tests. Defaults to newGoGithubClient.
 	NewGitHubClient func(token string) githubClient
+
+	// AutoDeployEnvironments lists the environments a Release may enable
+	// spec.autoDeploy in. Defaults to DefaultAutoDeployEnvironments. This is
+	// enforced here, not only in Backstage's form, so a hand-written PR
+	// can't turn on auto-deploy for prod.
+	AutoDeployEnvironments []string
+
+	// AutoDeployPollInterval is how often an auto-deploy Release is
+	// re-reconciled to look for a newer CI run. Defaults to
+	// DefaultAutoDeployPollInterval.
+	AutoDeployPollInterval time.Duration
 }
 
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=releases,verbs=get;list;watch;create;update;patch;delete
@@ -139,12 +167,31 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	autoDeploy := autoDeployEnabled(release)
+	// waiting is how soon to look again when something isn't ready yet; an
+	// auto-deploy Release keeps polling for new builds even once synced.
+	waiting := ctrl.Result{RequeueAfter: 15 * time.Second}
+	synced := ctrl.Result{}
+	if autoDeploy {
+		synced = ctrl.Result{RequeueAfter: r.pollInterval()}
+		if !slices.Contains(r.autoDeployEnvironments(), release.Spec.Environment) {
+			// A spec change is what fixes this, and that triggers a reconcile
+			// on its own — nothing to requeue for.
+			r.setReady(release, metav1.ConditionFalse, "AutoDeployNotAllowed",
+				fmt.Sprintf("auto-deploy is not allowed in environment %q (allowed: %s)", release.Spec.Environment, strings.Join(r.autoDeployEnvironments(), ", ")))
+			release.Status.AutoDeploy = nil
+			return ctrl.Result{}, r.Status().Update(ctx, release)
+		}
+	} else {
+		release.Status.AutoDeploy = nil
+	}
+
 	repoURL, ready, err := r.resolveComponent(ctx, release)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
+		return waiting, r.Status().Update(ctx, release)
 	}
 
 	dbBinding, ready, err := r.resolveDatabaseBinding(ctx, release)
@@ -154,28 +201,135 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
+		return waiting, r.Status().Update(ctx, release)
 	}
 
-	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL)
+	version, run, ready, err := r.resolveVersion(ctx, release, repoURL)
+	if err != nil {
+		r.setReady(release, metav1.ConditionFalse, "VersionResolutionFailed", err.Error())
+		_ = r.Status().Update(ctx, release)
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		return synced, r.Status().Update(ctx, release)
+	}
+
+	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL, version)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	valuesContent, err := buildValuesFile(release, dbBinding)
+	valuesContent, err := buildValuesFile(version, dbBinding)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := r.syncToGitOps(ctx, release, envContent, valuesContent); err != nil {
+	if err := r.syncToGitOps(ctx, release, envContent, valuesContent, run); err != nil {
 		r.setReady(release, metav1.ConditionFalse, "SyncFailed", err.Error())
 		_ = r.Status().Update(ctx, release)
 		return ctrl.Result{}, err
 	}
 
+	if run != nil && (release.Status.AutoDeploy == nil || release.Status.AutoDeploy.DeployedVersion != run.HeadSHA) {
+		log.Info("auto-deployed new version", "component", release.Spec.ComponentRef.Name, "environment", release.Spec.Environment, "version", run.HeadSHA, "run", run.HTMLURL)
+		now := metav1.Now()
+		release.Status.AutoDeploy = &platformv1alpha1.AutoDeployStatus{
+			DeployedVersion: run.HeadSHA,
+			RunNumber:       run.RunNumber,
+			RunURL:          run.HTMLURL,
+			DeployedAt:      &now,
+		}
+	}
+
 	log.Info("release synced", "component", release.Spec.ComponentRef.Name, "environment", release.Spec.Environment)
-	r.setReady(release, metav1.ConditionTrue, "Synced", "wrote environments/values to application-repositories")
+	message := "wrote environments/values to application-repositories"
+	if autoDeploy {
+		message = fmt.Sprintf("auto-deploy: %s, from %s", shortSHA(version), release.Status.AutoDeploy.RunURL)
+	}
+	r.setReady(release, metav1.ConditionTrue, "Synced", message)
 	release.Status.ObservedGeneration = release.Generation
-	return ctrl.Result{}, r.Status().Update(ctx, release)
+	// When nothing changed (the common auto-deploy poll), this status is
+	// byte-identical to what's stored, so the API server treats the update
+	// as a no-op: no new resourceVersion, no watch event, no reconcile loop.
+	return synced, r.Status().Update(ctx, release)
+}
+
+// resolveVersion returns the commit to deploy. A pinned Release just uses
+// spec.version (run is nil). An auto-deploy Release uses the newest
+// successful CI run on the component's main branch — but never one older
+// than what it already deployed, so a re-run or out-of-order listing can't
+// roll it backwards. ready=false means there's no successful run yet; the
+// condition was set and the caller should poll again, not treat this as an
+// error.
+func (r *ReleaseReconciler) resolveVersion(ctx context.Context, release *platformv1alpha1.Release, repoURL string) (string, *workflowRun, bool, error) {
+	if !autoDeployEnabled(release) {
+		return release.Spec.Version, nil, true, nil
+	}
+
+	owner, repo, err := parseGitHubRepo(repoURL)
+	if err != nil {
+		return "", nil, false, err
+	}
+	gh, _, err := r.githubClientFor(ctx)
+	if err != nil {
+		return "", nil, false, err
+	}
+	latest, err := gh.LatestSuccessfulRun(ctx, owner, repo, ciWorkflowFile, ciBranch)
+	if err != nil {
+		return "", nil, false, err
+	}
+
+	deployed := release.Status.AutoDeploy
+	if latest == nil {
+		if deployed != nil && deployed.DeployedVersion != "" {
+			// Runs can age out of GitHub's listing; keep what's deployed.
+			latest = &workflowRun{HeadSHA: deployed.DeployedVersion, RunNumber: deployed.RunNumber, HTMLURL: deployed.RunURL}
+		} else {
+			r.setReady(release, metav1.ConditionFalse, "AwaitingFirstBuild",
+				fmt.Sprintf("no successful %s run on %s/%s %s yet", ciWorkflowFile, owner, repo, ciBranch))
+			return "", nil, false, nil
+		}
+	}
+	if deployed != nil && deployed.DeployedVersion != "" && latest.RunNumber < deployed.RunNumber {
+		latest = &workflowRun{HeadSHA: deployed.DeployedVersion, RunNumber: deployed.RunNumber, HTMLURL: deployed.RunURL}
+	}
+	return latest.HeadSHA, latest, true, nil
+}
+
+func autoDeployEnabled(release *platformv1alpha1.Release) bool {
+	return release.Spec.AutoDeploy != nil && release.Spec.AutoDeploy.Enabled
+}
+
+func (r *ReleaseReconciler) autoDeployEnvironments() []string {
+	if r.AutoDeployEnvironments == nil {
+		return DefaultAutoDeployEnvironments
+	}
+	return r.AutoDeployEnvironments
+}
+
+func (r *ReleaseReconciler) pollInterval() time.Duration {
+	if r.AutoDeployPollInterval <= 0 {
+		return DefaultAutoDeployPollInterval
+	}
+	return r.AutoDeployPollInterval
+}
+
+// parseGitHubRepo splits a Component's clone URL
+// (https://github.com/<owner>/<repo>.git, see resolveComponent) into owner
+// and repo.
+func parseGitHubRepo(repoURL string) (string, string, error) {
+	path := strings.TrimSuffix(strings.TrimPrefix(repoURL, "https://github.com/"), ".git")
+	parts := strings.Split(path, "/")
+	if path == repoURL || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("component repository %q is not a https://github.com/<owner>/<repo> URL", repoURL)
+	}
+	return parts[0], parts[1], nil
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // resolveComponent GETs the referenced Component — always from the fixed
@@ -333,7 +487,9 @@ func genericProviderFor(exportProvider string) (string, bool) {
 
 // syncToGitOps commits envContent/valuesContent into application-repositories
 // as one atomic commit, skipping entirely if both files already match.
-func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv1alpha1.Release, envContent, valuesContent []byte) error {
+// run is the CI run being auto-deployed, or nil for a pinned version; it
+// only changes the commit message.
+func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv1alpha1.Release, envContent, valuesContent []byte, run *workflowRun) error {
 	gh, owner, err := r.githubClientFor(ctx)
 	if err != nil {
 		return err
@@ -362,6 +518,9 @@ func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv
 	}
 
 	message := fmt.Sprintf("Release %s: sync %s/%s", release.Name, release.Spec.ComponentRef.Name, release.Spec.Environment)
+	if run != nil {
+		message = fmt.Sprintf("Release %s: auto-deploy %s/%s %s\n\nBuilt by %s", release.Name, release.Spec.ComponentRef.Name, release.Spec.Environment, shortSHA(run.HeadSHA), run.HTMLURL)
+	}
 	if _, err := gh.CommitFiles(ctx, owner, applicationRepositoriesRepo, applicationRepositoriesRef, message, files, headSHA, treeSHA); err != nil {
 		return fmt.Errorf("committing to %s: %w", applicationRepositoriesRepo, err)
 	}
