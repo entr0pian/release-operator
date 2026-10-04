@@ -201,12 +201,12 @@ var _ = Describe("Release Controller", func() {
 		}
 
 		setConnectionExport := func(ctx context.Context, database *unstructured.Unstructured, ready bool, provider, key string) {
-			Expect(unstructured.SetNestedSlice(database.Object, []interface{}{
-				map[string]interface{}{
+			Expect(unstructured.SetNestedSlice(database.Object, []any{
+				map[string]any{
 					"name":  "connection",
 					"type":  "Secret",
 					"ready": ready,
-					"location": map[string]interface{}{
+					"location": map[string]any{
 						"provider": provider,
 						"key":      key,
 					},

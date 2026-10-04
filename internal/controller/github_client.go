@@ -48,6 +48,22 @@ type githubClient interface {
 	// every other file in the repo is preserved untouched), and moves
 	// branch's ref to it. Returns the new commit's SHA.
 	CommitFiles(ctx context.Context, owner, repo, branch, message string, files map[string][]byte, parentSHA, baseTreeSHA string) (string, error)
+
+	// LatestSuccessfulRun returns the newest successful run of workflowFile
+	// triggered by a push to branch, or nil if there is none yet (including
+	// when the workflow file doesn't exist). Only auto-deploy calls this.
+	LatestSuccessfulRun(ctx context.Context, owner, repo, workflowFile, branch string) (*workflowRun, error)
+
+	// CompareCommits returns how head relates to base: "ahead", "behind",
+	// "identical" or "diverged" (GitHub's compare API). Auto-deploy only
+	// moves a Release's version to a commit that is ahead of it.
+	CompareCommits(ctx context.Context, owner, repo, base, head string) (string, error)
+}
+
+// workflowRun is the part of a GitHub Actions run auto-deploy needs.
+type workflowRun struct {
+	HeadSHA string
+	HTMLURL string
 }
 
 // goGithubClient is githubClient backed by a real GitHub API token.
@@ -125,6 +141,41 @@ func (c *goGithubClient) CommitFiles(ctx context.Context, owner, repo, branch, m
 	}
 
 	return commit.GetSHA(), nil
+}
+
+func (c *goGithubClient) LatestSuccessfulRun(ctx context.Context, owner, repo, workflowFile, branch string) (*workflowRun, error) {
+	// Same query as Backstage's DeployableVersionReader (the Create
+	// deployment Version picker), so auto-deploy and a person picking a
+	// version agree on what "deployable" means. A push run on main only
+	// succeeds once its push-image job has pushed the SHA-tagged image.
+	runs, _, err := c.gh.Actions.ListWorkflowRunsByFileName(ctx, owner, repo, workflowFile, &github.ListWorkflowRunsOptions{
+		Branch:      branch,
+		Event:       "push",
+		Status:      "success",
+		ListOptions: github.ListOptions{PerPage: 1},
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing %s runs on %s/%s: %w", workflowFile, owner, repo, err)
+	}
+	if len(runs.WorkflowRuns) == 0 {
+		return nil, nil
+	}
+	run := runs.WorkflowRuns[0]
+	return &workflowRun{
+		HeadSHA: run.GetHeadSHA(),
+		HTMLURL: run.GetHTMLURL(),
+	}, nil
+}
+
+func (c *goGithubClient) CompareCommits(ctx context.Context, owner, repo, base, head string) (string, error) {
+	comparison, _, err := c.gh.Repositories.CompareCommits(ctx, owner, repo, base, head, &github.ListOptions{PerPage: 1})
+	if err != nil {
+		return "", fmt.Errorf("comparing %s...%s on %s/%s: %w", base, head, owner, repo, err)
+	}
+	return comparison.GetStatus(), nil
 }
 
 func isNotFound(err error) bool {

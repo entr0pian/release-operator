@@ -21,9 +21,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -79,7 +82,22 @@ const (
 	// Database-specific "AWSSecretsManager" export enum above.
 	genericBindingTypeSecret         = "secret"
 	genericProviderAWSSecretsManager = "aws-secrets-manager"
+
+	// ciWorkflowFile/ciBranch are what auto-deploy watches on a component's
+	// repository: the platform-scaffolds golang-service CI workflow, which
+	// builds and pushes the commit-SHA-tagged image on every push to main.
+	// Backstage's Version picker reads the same workflow.
+	ciWorkflowFile = "ci.yaml"
+	ciBranch       = "main"
+
+	// DefaultAutoDeployPollInterval is how often an auto-deploy Release
+	// checks for a newer successful CI run when none is configured.
+	DefaultAutoDeployPollInterval = 60 * time.Second
 )
+
+// DefaultAutoDeployEnvironments is where auto-deploy is allowed when the
+// reconciler isn't configured otherwise.
+var DefaultAutoDeployEnvironments = []string{"dev"}
 
 // componentGVK is read as unstructured, not as a typed Go struct: Component
 // (component-operator) is owned by a different repository, and importing
@@ -110,6 +128,17 @@ type ReleaseReconciler struct {
 	// NewGitHubClient overrides how a githubClient is constructed from a
 	// token, for tests. Defaults to newGoGithubClient.
 	NewGitHubClient func(token string) githubClient
+
+	// AutoDeployEnvironments lists the environments a Release may enable
+	// spec.autoDeploy in. Defaults to DefaultAutoDeployEnvironments. This is
+	// enforced here, not only in Backstage's form, so a hand-written PR
+	// can't turn on auto-deploy for prod.
+	AutoDeployEnvironments []string
+
+	// AutoDeployPollInterval is how often an auto-deploy Release is
+	// re-reconciled to look for a newer CI run. Defaults to
+	// DefaultAutoDeployPollInterval.
+	AutoDeployPollInterval time.Duration
 }
 
 // +kubebuilder:rbac:groups=platform.taskapp.io,resources=releases,verbs=get;list;watch;create;update;patch;delete
@@ -138,13 +167,37 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.Get(ctx, req.NamespacedName, release); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if !release.DeletionTimestamp.IsZero() {
+		// Being deleted (e.g. a teardown removing it from git): writing its
+		// files back now would leave them dangling in application-repositories.
+		return ctrl.Result{}, nil
+	}
+
+	autoDeploy := autoDeployEnabled(release)
+	// waiting is how soon to look again when something isn't ready yet; an
+	// auto-deploy Release keeps polling for new builds even once synced.
+	waiting := ctrl.Result{RequeueAfter: 15 * time.Second}
+	synced := ctrl.Result{}
+	if autoDeploy {
+		synced = ctrl.Result{RequeueAfter: r.pollInterval()}
+		if !slices.Contains(r.autoDeployEnvironments(), release.Spec.Environment) {
+			// A spec change is what fixes this, and that triggers a reconcile
+			// on its own — nothing to requeue for.
+			r.setReady(release, metav1.ConditionFalse, "AutoDeployNotAllowed",
+				fmt.Sprintf("auto-deploy is not allowed in environment %q (allowed: %s)", release.Spec.Environment, strings.Join(r.autoDeployEnvironments(), ", ")))
+			release.Status.AutoDeploy = nil
+			return ctrl.Result{}, r.Status().Update(ctx, release)
+		}
+	} else {
+		release.Status.AutoDeploy = nil
+	}
 
 	repoURL, ready, err := r.resolveComponent(ctx, release)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
+		return waiting, r.Status().Update(ctx, release)
 	}
 
 	dbBinding, ready, err := r.resolveDatabaseBinding(ctx, release)
@@ -154,7 +207,26 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, r.Status().Update(ctx, release)
+		return waiting, r.Status().Update(ctx, release)
+	}
+
+	if autoDeploy {
+		before := release.Status.DeepCopy()
+		if err := r.runAutoDeploy(ctx, release, repoURL); err != nil {
+			r.setReady(release, metav1.ConditionFalse, "AutoDeployFailed", err.Error())
+			_ = r.Status().Update(ctx, release)
+			return ctrl.Result{}, err
+		}
+		if release.Spec.Version == "" {
+			// Nothing to deploy until a first version is committed and applied.
+			r.setReady(release, metav1.ConditionFalse, release.Status.AutoDeploy.Reason, release.Status.AutoDeploy.Message)
+			return synced, r.Status().Update(ctx, release)
+		}
+		if equality.Semantic.DeepEqual(before, &release.Status) && lastSyncCurrent(release) {
+			// The common poll: no newer build, and spec.version was already
+			// written for this generation. Skip reading application-repositories.
+			return synced, nil
+		}
 	}
 
 	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL)
@@ -175,7 +247,55 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	log.Info("release synced", "component", release.Spec.ComponentRef.Name, "environment", release.Spec.Environment)
 	r.setReady(release, metav1.ConditionTrue, "Synced", "wrote environments/values to application-repositories")
 	release.Status.ObservedGeneration = release.Generation
-	return ctrl.Result{}, r.Status().Update(ctx, release)
+	// For an auto-deploy Release with nothing new, this status is
+	// byte-identical to what's stored, so the API server treats the update
+	// as a no-op: no new resourceVersion, no watch event, no reconcile loop.
+	return synced, r.Status().Update(ctx, release)
+}
+
+// lastSyncCurrent reports whether the current spec was already synced to
+// application-repositories, with nothing failing since.
+func lastSyncCurrent(release *platformv1alpha1.Release) bool {
+	ready := apimeta.FindStatusCondition(release.Status.Conditions, readyConditionType)
+	return release.Status.ObservedGeneration == release.Generation &&
+		ready != nil && ready.Status == metav1.ConditionTrue && ready.Reason == "Synced"
+}
+
+func autoDeployEnabled(release *platformv1alpha1.Release) bool {
+	return release.Spec.AutoDeploy != nil && release.Spec.AutoDeploy.Branch != ""
+}
+
+func (r *ReleaseReconciler) autoDeployEnvironments() []string {
+	if r.AutoDeployEnvironments == nil {
+		return DefaultAutoDeployEnvironments
+	}
+	return r.AutoDeployEnvironments
+}
+
+func (r *ReleaseReconciler) pollInterval() time.Duration {
+	if r.AutoDeployPollInterval <= 0 {
+		return DefaultAutoDeployPollInterval
+	}
+	return r.AutoDeployPollInterval
+}
+
+// parseGitHubRepo splits a Component's clone URL
+// (https://github.com/<owner>/<repo>.git, see resolveComponent) into owner
+// and repo.
+func parseGitHubRepo(repoURL string) (string, string, error) {
+	path := strings.TrimSuffix(strings.TrimPrefix(repoURL, "https://github.com/"), ".git")
+	parts := strings.Split(path, "/")
+	if path == repoURL || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("component repository %q is not a https://github.com/<owner>/<repo> URL", repoURL)
+	}
+	return parts[0], parts[1], nil
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
 }
 
 // resolveComponent GETs the referenced Component — always from the fixed
@@ -301,7 +421,7 @@ func findExport(database *unstructured.Unstructured, name string) (databaseExpor
 		return databaseExport{}, false
 	}
 	for _, raw := range exports {
-		entry, ok := raw.(map[string]interface{})
+		entry, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}

@@ -42,6 +42,21 @@ spec:
           spec:
             description: spec defines the desired state of Release
             properties:
+              autoDeploy:
+                description: |-
+                  autoDeploy, when set, keeps version at the newest successfully built
+                  commit on a branch — see AutoDeploySpec.
+                properties:
+                  branch:
+                    description: |-
+                      branch is the branch to follow, normally main. Only honoured in the
+                      environments the operator is started with (--auto-deploy-environments,
+                      "dev" by default).
+                    minLength: 1
+                    type: string
+                required:
+                - branch
+                type: object
               bindings:
                 description: |-
                   bindings declares which runtime dependencies are enabled for this
@@ -85,17 +100,45 @@ spec:
                   version is the commit of the component's repository to deploy: used
                   both as the image tag and as the revision the chart is read from, so
                   it must be a git ref whose image exists (CI tags images with the full
-                  commit SHA).
+                  commit SHA). Optional only with autoDeploy, which sets it (in git)
+                  once the branch has its first successful build, and moves it forward
+                  after that.
                 minLength: 1
                 type: string
             required:
             - componentRef
             - environment
-            - version
             type: object
+            x-kubernetes-validations:
+            - message: set version, autoDeploy, or both
+              rule: has(self.version) || has(self.autoDeploy)
           status:
             description: status defines the observed state of Release
             properties:
+              autoDeploy:
+                description: autoDeploy is set while spec.autoDeploy is — see AutoDeployStatus.
+                properties:
+                  branch:
+                    description: branch is the branch being followed (spec.autoDeploy.branch).
+                    type: string
+                  latestDeployable:
+                    description: |-
+                      latestDeployable is the newest commit on branch with a successful CI
+                      build, or empty before the first one.
+                    type: string
+                  message:
+                    description: message explains reason.
+                    type: string
+                  reason:
+                    description: |-
+                      reason is one of UpToDate, Deploying (version committed, waiting for
+                      Argo CD to apply it), WaitingForFirstBuild, NotFastForward,
+                      ReleaseFileNotFound.
+                    type: string
+                  runURL:
+                    description: runURL links to the CI run that built latestDeployable.
+                    type: string
+                type: object
               conditions:
                 description: |-
                   conditions represent the current state of the Release resource.

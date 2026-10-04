@@ -58,7 +58,21 @@ type ReleaseBindings struct {
 	Database *DatabaseBinding `json:"database,omitempty"`
 }
 
+// AutoDeploySpec makes a Release follow a branch of its component's
+// repository: whenever a newer commit on it has a successful CI build, the
+// operator commits that commit as spec.version to this Release's file in
+// application-repositories, and Argo CD applies it like any other change.
+type AutoDeploySpec struct {
+	// branch is the branch to follow, normally main. Only honoured in the
+	// environments the operator is started with (--auto-deploy-environments,
+	// "dev" by default).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Branch string `json:"branch"`
+}
+
 // ReleaseSpec defines the desired state of Release
+// +kubebuilder:validation:XValidation:rule="has(self.version) || has(self.autoDeploy)",message="set version, autoDeploy, or both"
 type ReleaseSpec struct {
 	// componentRef is the authoritative reference to the owning Component.
 	// +required
@@ -73,15 +87,51 @@ type ReleaseSpec struct {
 	// version is the commit of the component's repository to deploy: used
 	// both as the image tag and as the revision the chart is read from, so
 	// it must be a git ref whose image exists (CI tags images with the full
-	// commit SHA).
-	// +required
+	// commit SHA). Optional only with autoDeploy, which sets it (in git)
+	// once the branch has its first successful build, and moves it forward
+	// after that.
+	// +optional
 	// +kubebuilder:validation:MinLength=1
-	Version string `json:"version"`
+	Version string `json:"version,omitempty"`
+
+	// autoDeploy, when set, keeps version at the newest successfully built
+	// commit on a branch — see AutoDeploySpec.
+	// +optional
+	AutoDeploy *AutoDeploySpec `json:"autoDeploy,omitempty"`
 
 	// bindings declares which runtime dependencies are enabled for this
 	// component/environment, and which resource to resolve each from.
 	// +optional
 	Bindings ReleaseBindings `json:"bindings,omitempty"`
+}
+
+// AutoDeployStatus reports what auto-deploy last found, for Backstage to
+// show. Deliberately no timestamp: every status write triggers another
+// reconcile, so a "last checked" time would make an idle Release reconcile
+// itself in a loop.
+type AutoDeployStatus struct {
+	// branch is the branch being followed (spec.autoDeploy.branch).
+	// +optional
+	Branch string `json:"branch,omitempty"`
+
+	// latestDeployable is the newest commit on branch with a successful CI
+	// build, or empty before the first one.
+	// +optional
+	LatestDeployable string `json:"latestDeployable,omitempty"`
+
+	// runURL links to the CI run that built latestDeployable.
+	// +optional
+	RunURL string `json:"runURL,omitempty"`
+
+	// reason is one of UpToDate, Deploying (version committed, waiting for
+	// Argo CD to apply it), WaitingForFirstBuild, NotFastForward,
+	// ReleaseFileNotFound.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// message explains reason.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // ReleaseStatus defines the observed state of Release.
@@ -104,6 +154,10 @@ type ReleaseStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// autoDeploy is set while spec.autoDeploy is — see AutoDeployStatus.
+	// +optional
+	AutoDeploy *AutoDeployStatus `json:"autoDeploy,omitempty"`
 }
 
 // +kubebuilder:object:root=true
