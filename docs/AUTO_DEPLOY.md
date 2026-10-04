@@ -1,10 +1,15 @@
 # Auto-deploy
 
-A `Release` can follow its component's `main` branch instead of a pinned
-version. release-operator then deploys every successful CI build on `main` by
-itself, committing straight to `application-repositories`, with no PR per
-deploy. This document is the agreed plan, the reasoning behind each decision,
-and the tests run against the implementation, with their results.
+A `Release` can follow a branch of its component's repository instead of a
+pinned version. Whenever a newer commit on that branch has a successful CI
+build, release-operator commits that commit as `spec.version` to the
+Release's own file in `application-repositories`. Argo CD applies the file
+like any other change, and the Release then deploys the usual way. There is
+no PR per deploy, and git stays the record of what runs where.
+
+This implements the platform-component half of the design in
+`platform-architecture/AUTO_DEPLOY.md`, with the GitHub App deferred (see
+[Authentication](#authentication)).
 
 Changes span four repositories, each on branch
 `claude/release-operator-auto-deploy-oyxd5o`:
@@ -16,9 +21,6 @@ Changes span four repositories, each on branch
 | `application-repositories` | README only (no structural change) |
 | `platform-scaffolds` | README only (documents `ci.yaml` as a contract) |
 
-Nothing changes in `component-operator`, `helm-charts` or the scaffold's CI
-workflow itself.
-
 ## How it works
 
 ```
@@ -29,318 +31,244 @@ developer pushes to main of <component>
         │  (run succeeds)
         ▼
 release-operator, polling the Release every 60s:
-  GET /repos/<owner>/<component>/actions/workflows/ci.yaml/runs
-      ?branch=main&event=push&status=success&per_page=1
-        │  newer run than status.autoDeploy.runNumber?
+  newest successful push run of ci.yaml on spec.autoDeploy.branch
+        │  newer than spec.version, and ahead of it on the branch?
         ▼
-commit to application-repositories main (no PR):
-  components/<component>/values/dev.yaml        image.tag      = <sha>
-  components/<component>/environments/dev.yaml  targetRevision = <sha>
+commit 1 to application-repositories main (no PR), the Release file only:
+  platform/environments/dev/<component>-release.yaml   spec.version = <sha>
         │
+        ▼  push webhook → Argo CD applies the Release (generation bumps)
         ▼
-Release status.autoDeploy = { deployedVersion, runNumber, runURL, deployedAt }
+release-operator reconciles it the normal way (no auto-deploy write: up to date)
+commit 2, exactly as for a hand-pinned Release:
+  components/<component>/environments/dev.yaml  targetRevision = <sha>
+  components/<component>/values/dev.yaml        image.tag      = <sha>
         │
         ▼
 Argo CD syncs dev
 ```
 
-## The plan
+Auto-deploy only ever writes the Release file. The `components/` files are
+still written by the one existing path, from the Release Argo CD applied.
 
-### 1. Release API (`api/v1alpha1/release_types.go`)
+## The API
 
 ```yaml
 spec:
   componentRef: { name: orders }
   environment: dev
+  version: "1a2b3c4…"     # set by release-operator in git; absent only before the first build
   autoDeploy:
-    enabled: true        # exactly one of this or `version`
+    branch: main
 status:
   autoDeploy:
-    deployedVersion: <sha>
-    runNumber: 42
-    runURL: https://github.com/<owner>/orders/actions/runs/...
-    deployedAt: <time>
+    branch: main
+    latestDeployable: 1a2b3c4…
+    runURL: https://github.com/<owner>/orders/actions/runs/…
+    reason: UpToDate | Deploying | WaitingForFirstBuild | NotFastForward | ReleaseFileNotFound
+    message: …
 ```
 
-- `spec.autoDeploy: { enabled: bool }` is new.
-- `spec.version` becomes optional. A CEL rule on the spec enforces
-  "set exactly one of version or autoDeploy.enabled". The API server rejects
-  both and rejects neither.
-- `status.autoDeploy` records what was deployed.
-- The CRD is regenerated in `config/crd/bases/` and copied into
-  `chart/templates/crd/`.
+- `spec.autoDeploy.branch` (required inside `autoDeploy`) turns it on.
+- `spec.version` stays the single source of truth for what runs. It may be
+  absent only when `autoDeploy` is set (CEL rule:
+  `has(self.version) || has(self.autoDeploy)`), so a service can be onboarded
+  before its first build. Both together is the normal state.
+- Turning auto-deploy off (a PR removing `autoDeploy`) leaves the Release
+  pinned at whatever `version` it has. That is also the way to pause it.
+- `status.autoDeploy` has **no timestamp**. Every status write triggers another
+  reconcile, so a "last checked" time would make an idle Release reconcile
+  itself in a loop.
 
-**Why a struct, not a bool:** it leaves room for `branch` or `workflow` later
-without another API change.
+## The decision, step by step
 
-**Why version and auto-deploy are mutually exclusive:** a Release with both
-would be ambiguous. Making the API reject it means every consumer
-(Backstage, the operator, people reading the file) only ever has one
-question to ask: pinned or following main.
+On every reconcile of a Release with `autoDeploy`:
 
-### 2. The operator never writes the version into `spec`
+1. **Environment allowed?** Not in `--auto-deploy-environments` (default
+   `dev`) → `Ready=False, reason=AutoDeployNotAllowed`; nothing is polled or
+   written. This is enforced here, not only by the Backstage form, so a
+   hand-written PR can't turn auto-deploy on for prod.
+2. **Newest successful build** on the branch: the newest successful `push`
+   run of `ci.yaml` (same query as Backstage's Version picker,
+   `DeployableVersionReader.ts`). In the scaffold's `ci.yaml` such a run only
+   succeeds once `push-image` has pushed the SHA-tagged image.
+   - None, and no `version` yet → `WaitingForFirstBuild`, poll again.
+   - None, but a `version` (runs aged out of the listing) → keep it.
+   - Same as `spec.version` → `UpToDate`.
+3. **Read the Release file from git, at a pinned head.** The operator reads
+   `application-repositories`' head commit first and the file at exactly that
+   commit, then commits with that commit as parent. If anything lands in
+   between, GitHub rejects the commit and the reconcile retries.
+4. **Git wins over the cluster.** Every decision uses the file, not the
+   cluster copy, which can lag a merge until Argo CD syncs:
+   - File missing, or holding another Release → `ReleaseFileNotFound`; the
+     file is **never created** (a teardown may have just removed it).
+   - File no longer has `autoDeploy.branch` (someone turned it off and Argo CD
+     hasn't applied it yet) → `Deploying`, no write.
+   - File already has the newest build → `Deploying`, waiting for Argo CD.
+5. **Forward only.** If the file has a version, GitHub's compare API must say
+   the new build is `ahead` of it on the branch. `behind` or `diverged` →
+   `NotFastForward`, no write. Because the reference point is the version in
+   git, this survives a cluster rebuild.
+6. **Commit** `spec.version` into the file: `Auto-deploy <component> <sha7> to
+   <env>`, with the CI run linked in the body. The file is edited as a YAML
+   node tree, so bindings, labels, comments and key order are untouched; a
+   missing `version` is added right after `environment`.
 
-The Release manifest lives in git
-(`platform/environments/<env>/<component>-release.yaml`) and Argo CD applies
-it. If the operator wrote each new SHA into `spec.version`, Argo CD would
-either revert it (self-heal) or show the Release OutOfSync forever, and git
-would stop being the source of truth. So the version the operator picked lives
-only in `status.autoDeploy`. The Release file in git doesn't change on a
-deploy; only `components/<component>/…` does.
+Then, as for any Release: without a `version` there's nothing to deploy yet;
+with one, the existing path writes the `components/` files.
 
-### 3. How a new build is detected: polling, not webhooks
-
-A Release with auto-deploy on requeues every `--auto-deploy-poll-interval`
-(default 60s). Each reconcile asks GitHub for the newest successful run of
-`ci.yaml` triggered by a push to `main`.
-
-Why polling rather than webhooks:
-- A webhook alone can miss deliveries (operator restarting, cluster being
-  rebuilt), so something would have to catch up anyway. Polling is that
-  catch-up, and it is idempotent: a poll that finds nothing new does nothing.
-- Webhooks would also need registering on every service repository, which
-  component-operator would have to do for each new Component.
-- The management cluster already receives GitHub push webhooks for Argo CD
-  (with a shared HMAC secret), so a `workflow_run` webhook that only triggers
-  a reconcile is a small follow-up: it cuts deploy latency, with polling still
-  the source of truth.
-
-Why this exact query:
-- It is the same one Backstage's Create deployment Version picker uses
-  (`DeployableVersionReader.ts`), so auto-deploy and a person picking a version
-  agree on what "deployable" means.
-- In the scaffold's `ci.yaml`, a push run on `main` only succeeds once its
-  `push-image` job has pushed the SHA-tagged image, so the image is guaranteed
-  to exist.
-
-Cost: one API call per auto-deploy Release per minute. An idle poll stops
-there: when the newest run is the one already deployed, the spec hasn't
-changed and the last sync succeeded, the operator doesn't read
-`application-repositories` at all. The trade-off is that a hand edit to the
-component's files there isn't reverted until the next build or Release
-change, which is how pinned Releases already behave. That's well inside
-GitHub's 5,000/hour limit for roughly 80 auto-deploy Releases sharing one
-token. Conditional (ETag) requests would make polls nearly free and are a
-possible follow-up.
-
-### 4. Writing to application-repositories: reuse the existing path
-
-The resolved SHA goes through the operator's existing
-`buildEnvironmentsFile` / `buildValuesFile` / `syncToGitOps`. That path is
-already a single atomic commit straight to `main` (no PR), and it already
-skips the commit when both files match. The only differences for an auto-deploy
-Release:
-- The version comes from the CI run instead of `spec.version`.
-- The commit message is `Release <name>: auto-deploy <component>/<env> <sha7>`
-  and links to the run.
-
-### 5. Guards
+### Guards in one table
 
 | Guard | Behaviour | Why |
 |---|---|---|
-| Dev only | `--auto-deploy-environments` (default `dev`). A Release with auto-deploy in any other environment gets `Ready=False, reason=AutoDeployNotAllowed`; nothing is polled or written. | Greying the toggle out in Backstage only stops people using the form. A hand-written PR could still put `autoDeploy` on a prod Release. |
-| Forward only | Never deploy a run with a lower `runNumber` than `status.autoDeploy.runNumber`. | A re-run or an out-of-order listing must not roll dev backwards. The guard lives in status, so it starts fresh when status is lost (cluster rebuilt, auto-deploy turned off and on). That's harmless: the newest successful run is always the one picked. |
-| No build yet | `Ready=False, reason=AwaitingFirstBuild`, poll again. Not an error. | Right after onboarding, the repository and its first CI run don't exist yet. |
-| Runs aged out | If GitHub lists no runs but one was already deployed, keep it. | A quiet repository shouldn't make the Release regress to "waiting". |
-| No hot loop | A poll that finds nothing new writes a byte-identical status, which the API server treats as a no-op: no new `resourceVersion`, no watch event. | The controller reconciles on every change to the Release. A timestamp written on every poll would make it reconcile itself continuously. |
+| Dev only | `--auto-deploy-environments`, default `dev` | Backstage greying the toggle out doesn't stop a hand-written PR. |
+| Forward only | compare API against the version in git | A re-run or slow older build must not roll dev backwards, also after a cluster rebuild. |
+| Git wins | decide from the file at a pinned head; commit on that parent | A human change that hasn't synced yet must never be overwritten. |
+| Never create the file | missing file → `ReleaseFileNotFound` | Teardown removes Release files first; recreating them is the write-back race that left dangling files before. |
+| Deleting Releases | a Release with a `deletionTimestamp` writes nothing | Same teardown race, for the `components/` files. |
+| No hot loop | idle polls write a byte-identical status, which the API server treats as a no-op | The controller reconciles on every change to the Release. |
+| Cheap idle polls | nothing newer and the spec already synced → stop after the runs query | One GitHub call per Release per poll; `application-repositories` isn't read. |
 
-### 6. Operator flags (`cmd/main.go`)
+## Polling, not (yet) webhooks
+
+A Release with `autoDeploy` requeues every `--auto-deploy-poll-interval`
+(default 60s). Polling is the source of truth because a webhook alone can miss
+deliveries (operator restarting, cluster rebuilt) and would need catching up
+anyway. The management cluster already receives GitHub push webhooks for Argo
+CD (shared HMAC secret), so a `workflow_run` webhook that only enqueues the
+matching Release is a small follow-up that cuts latency; polling stays as the
+fallback.
+
+Cost: one GitHub API call per auto-deploy Release per poll while idle; a new
+build adds three or four (head, file, compare, commit). Well inside the 5,000/h
+limit for dozens of Releases sharing one token.
+
+## Operator flags (`cmd/main.go`)
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--auto-deploy-environments` | `dev` | Comma-separated environments where `spec.autoDeploy` is honoured. |
-| `--auto-deploy-poll-interval` | `60s` | How often an auto-deploy Release checks for a newer run. |
+| `--auto-deploy-poll-interval` | `60s` | How often an auto-deploy Release checks for a newer build. |
 
 Set them through the chart's `manager.args` if the defaults need changing.
-The GitHub token in `crossplane-system/crossplane-github-credentials` also
-needs `actions:read` on the service repositories. It created those
-repositories, so it should already have it.
 
-### 7. Backstage
+## Authentication
+
+For now the operator uses the shared `crossplane-system/crossplane-github-credentials`
+PAT (a fine-grained `entr0pian` token), for both the runs query and the commit.
+Service repositories are public, so listing their Actions runs works without
+an explicit Actions permission; a **private** service repo needs
+"Actions: Read-only" on the token. The plan is to move release-operator to a
+GitHub App (`taskapp-deployer`: Contents read/write, Actions read, installed on
+all repositories), with the PAT as a fallback while the App's Secret is absent.
+
+## Backstage
 
 **Onboard Service**
-- New checkbox "Set up auto deployment to dev", off by default.
-- When it's ticked, the onboarding PR also adds
-  `platform/environments/dev/<name>-release.yaml`: auto-deploy on, no version,
-  no bindings.
-- The name and path are the same ones Create deployment uses, so Create
-  deployment later shows this file as committed and edits it.
+- "Set up auto deployment to `<env>`" (`PlatformAutoDeploySetup`), **on by
+  default**. `<env>` is the first entry of `platform.autoDeployEnvironments`,
+  not a hardcoded `dev` (`platform.environments` starts with `management`, so
+  it can't be used for this).
+- When on, the onboarding PR also adds
+  `platform/environments/<env>/<name>-release.yaml`: `autoDeploy: {branch:
+  main}`, no version, no bindings, at the path and name Create deployment uses.
 
 **Create deployment**
-- **Auto-deploy toggle** (`PlatformAutoDeployToggle`), placed between
-  Environment and Version:
-  - Greyed out and off outside `platform.autoDeployEnvironments` (default
-    `[dev]`, which must match the operator flag).
-  - In dev it starts as what's committed in git. It reads that from the new
-    `GET /api/platform/committed-releases/:component/:environment`, which
-    reads the file from `application-repositories` `main`. Git is used rather
-    than the cluster copy because the cluster lags a merge until Argo CD syncs
-    and doesn't exist before the first sync.
+- **Auto-deploy toggle** (`PlatformAutoDeployToggle`) between Environment and
+  Version:
+  - Greyed out and off outside `platform.autoDeployEnvironments`.
+  - In an allowed environment it starts as what's committed in git
+    (`GET /api/platform/committed-releases/:component/:environment`).
+  - If that can't be read, the toggle is locked and the form refuses to
+    submit, so a failed lookup can't silently turn auto-deploy off.
   - Locked off when the form is opened by Roll back.
-- **Version picker:**
-  - Greyed out and cleared while auto-deploy is on.
-  - Required only when auto-deploy is off. This is a schema `if`/`else`, not
-    an unconditional `required`.
-- **Rendered Release:** contains `autoDeploy.enabled: true` or
-  `version: <sha>`, never both. Turning auto-deploy off therefore pins a
-  version, and turning it on clears the pin.
-- **PR:** titled `Enable auto-deploy for <component> in dev`, on branch
-  `backstage/deploy-<component>-dev-auto`.
+- **Version picker:** greyed out and cleared while auto-deploy is on; required
+  only when it's off (schema `if`/`else`).
+- **Rendered Release:** `version` when one was picked, `autoDeploy: {branch:
+  main}` when the toggle is on. Turning it on drops the version; the operator
+  sets it to the newest build within a poll.
 
 **Deployments card**
-- An auto-deploy environment shows an **Auto-deploy** badge and **no Roll back
-  button**. The next build on `main` would deploy straight over a roll back.
-  The ways back are reverting the commit on `main` (fix forward), or turning
-  auto-deploy off and pinning a version.
-- Everything that read `spec.version` (card version, rollout progress, the
-  "running image matches the Release" check) now reads the effective version:
-  `spec.version`, or `status.autoDeploy.deployedVersion` for an auto-deploy
-  Release.
+- An auto-deploy environment shows an **Auto-deploy** badge and no Roll back:
+  the next build would move straight past it. The ways back are reverting on
+  `main` (fix forward) or turning auto-deploy off and pinning a version.
+- Versions are read from `spec.version` as for any Release; empty means
+  waiting for the first build.
 
-### Decided against or out of scope
+## Decided against or out of scope
 
 | Idea | Decision | Reason |
 |---|---|---|
-| Operator edits `spec.version` | Rejected | Fights Argo CD (see §2). |
-| Each service's CI pushes to application-repositories itself | Rejected | It would put write credentials for the GitOps repo in every service repo. With this design one credential, held by the operator, does it. |
-| Warning in the PR when Create deployment would turn auto-deploy off | Rejected | Replaced by the form showing the committed state and allowing only valid combinations. |
-| Roll back on an auto-deploy environment that pins the old version | Rejected | The button is hidden instead, which is simpler. Pinning stays one deliberate step away in Create deployment. |
-| Promote (dev → prod) button | Out of scope | Agreed to keep this change focused. |
-| Webhook trigger | Out of scope | Polling first; a `workflow_run` webhook is the natural speed-up (see §3). |
+| Version only in `status`, operator writes `components/` directly | Rejected | Git would stop saying what runs; a cluster rebuild would lose the version; Promote couldn't copy dev's version from the Release file. |
+| Operator patches `spec.version` on the cluster object | Rejected | Argo CD would revert it (self-heal). The change goes to git instead. |
+| Release file + `components/` in one commit | Rejected | It would mix git state with a possibly stale cluster copy (bindings); two commits keep one writer per file kind, and webhooks keep the delay to seconds. |
+| Each service's CI pushes to `application-repositories` | Rejected | Write credentials for the GitOps repo in every service repo. |
+| `status.autoDeploy.lastChecked` (from the design doc) | Rejected | Self-reconcile loop; see [The API](#the-api). |
+| Promote (dev → prod), prod Rollback | Out of scope | Next step; `spec.version` in git is what Promote copies. |
+| GitHub App, `workflow_run` webhook | Out of scope | Next steps, above. |
 
 ## Tests run and results
 
-All of these were run in this branch's environment before pushing.
-
 ### release-operator
 
-**Unit and envtest suite.** Run with
-`KUBEBUILDER_ASSETS=bin/k8s/1.35.0-linux-amd64 go test ./...`. It uses a real
-kube-apiserver and etcd (envtest, Kubernetes 1.35), so CRD validation and
-status-update behaviour are the real thing. GitHub is an in-memory fake
+`KUBEBUILDER_ASSETS=bin/k8s/1.35.0-linux-amd64 go test ./internal/...`, with
+a real kube-apiserver and etcd (envtest, Kubernetes 1.35), so CRD validation
+and status-update behaviour are real. GitHub is an in-memory fake
 (`fakeGitHub` in `internal/controller/auto_deploy_test.go`).
 
 ```
-Ran 21 of 21 Specs in 7.554 seconds
-SUCCESS! -- 21 Passed | 0 Failed | 0 Pending | 0 Skipped
-ok  github.com/entr0pian/release-operator/internal/controller
+Ran 29 of 29 Specs
+SUCCESS! -- 29 Passed | 0 Failed | 0 Pending | 0 Skipped
 ```
 
-New specs (all passed):
+Auto-deploy specs:
 
 | Spec | Checks |
 |---|---|
-| API validation rejects a Release with both version and autoDeploy.enabled | The CEL rule, enforced by the real API server |
-| API validation rejects a Release with neither version nor autoDeploy.enabled | Same, the other way round |
-| refuses auto-deploy outside the allowed environments, without calling GitHub | `prod` + auto-deploy → `AutoDeployNotAllowed`, no runs queried, no commit, no requeue |
-| waits for the first successful build instead of failing | No run yet → `AwaitingFirstBuild`, requeue after the poll interval, no commit. Queries `entr0pian/orders ci.yaml@main` |
-| deploys the latest successful run directly to application-repositories and records it in status | Run #7 → one commit with the SHA in `values/dev.yaml` and `targetRevision`, commit message links the run, `spec.version` stays empty, `status.autoDeploy` set. Then run #8 → rolls forward. Then run #7 reported again → stays on #8 |
-| makes no commit, no file reads and no status write when nothing changed | A second poll with the same run → no commit, no read of `application-repositories`, and an **unchanged `resourceVersion`** (no reconcile loop) |
-| leaves a pinned Release unchanged: deploys spec.version, never polls, never requeues | Regression check for the existing behaviour |
-| parseGitHubRepo splits a Component clone URL / rejects non-GitHub URLs | URL parsing |
+| rejects neither version nor autoDeploy / autoDeploy without a branch; accepts both | The CEL rule and `branch` validation, enforced by the real API server |
+| refuses auto-deploy outside the allowed environments | `prod` → `AutoDeployNotAllowed`, no GitHub calls, no commit |
+| waits for the first successful build | `WaitingForFirstBuild`, requeue at the poll interval, no commit |
+| commits the first build to the Release file only, and deploys once Argo CD applies it | First commit touches **only** the Release file (exact rendered YAML, message, run link), cluster copy unpatched; a second poll doesn't recommit; after "Argo CD" applies the version, the normal path writes `components/` |
+| moves the version forward only when the new build is ahead | Compare `behind` → `NotFastForward`, file unchanged; `ahead` → file moves to the new SHA |
+| leaves the file alone when git no longer has auto-deploy | Cluster says on, git says off → no write |
+| never creates a missing Release file, or edits another Release's | `ReleaseFileNotFound`, nothing written |
+| makes no commit, no file reads and no status write when nothing changed | Idle poll: no `application-repositories` read, **unchanged `resourceVersion`** |
+| writes nothing to git for a Release being deleted | No GitHub calls at all |
+| leaves a pinned Release unchanged | Regression check for the existing behaviour |
+| releaseFile: sets/adds version, rejects non-Releases | YAML round-trip keeps every other line, including a comment |
 
-The 11 existing specs (Component resolution, database binding, GitOps file
-rendering) still pass unchanged.
+A mutation check confirmed the "git wins" spec fails when its guard is
+removed.
 
-**Code generation:** `make manifests generate fmt vet` is clean. The CRD and
-deepcopy code were regenerated, and the chart CRD was synced from
-`config/crd/bases`.
-
-**Lint:** `bin/golangci-lint run` reports 0 findings in code this change adds.
-3 `modernize` findings remain; they are on `main` already, in lines this
-change doesn't touch (`interface{}` → `any` in `findExport` and in
-`release_controller_test.go`).
-
-`make test` itself exits non-zero in this sandbox. The cause is
-`go: no such tool "covdata"` when it collects coverage for packages with no
-tests. This happens identically on `main`, is a property of the sandbox's Go
-toolchain, and the controller package's tests pass in the same run.
+`make manifests generate fmt vet` is clean; the chart CRD was synced from
+`config/crd/bases`. `bin/golangci-lint run`: **0 issues** (the three old
+`interface{}` findings on `main` are fixed on this branch).
 
 ### backstage
 
-| Check | Command | Result |
-|---|---|---|
-| Typecheck | `yarn tsc` | 0 errors (also 0 on `main` beforehand) |
-| Frontend tests | `yarn backstage-cli package test src/modules` in `packages/app` | 24 suites, **123 passed**, 0 failed |
-| Backend tests | `yarn backstage-cli package test src/modules` in `packages/backend` | 14 suites, **163 passed**, 0 failed |
-| Lint | `yarn backstage-cli package lint` in `packages/app` and `packages/backend` | clean |
-| Template render, Create deployment | `node --test templates/create-deployment/render.test.mjs` | 5/5 passed |
-| Template render, Onboard Service | `node --test templates/onboard-service/render.test.mjs` | 5/5 passed |
-| Template render, Add Database (unchanged) | `node --test templates/add-database/render.test.mjs` | 2/2 passed |
+| Check | Result |
+|---|---|
+| `yarn tsc` | 0 errors |
+| App tests (`CI=true yarn backstage-cli package test src/modules`) | 25 suites, **131 passed** |
+| Backend tests (same, `packages/backend`) | 14 suites, **164 passed** |
+| `backstage-cli package lint`, app and backend | clean |
+| Template render tests: create-deployment / onboard-service / add-database | 5/5, 6/6, 2/2 |
 
-New tests:
-- `AutoDeployToggle.test.tsx`
-  - Greyed out and off in `prod`, and never calls the backend there.
-  - Turns itself off when the environment changes to one without
-    auto-deploy.
-  - Starts **on** in dev when the committed Release has auto-deploy, and
-    calls `/committed-releases/orders/dev`.
-  - Starts **off** in dev when the committed Release pins a version.
-  - Locked off for a roll back.
-- `CommittedReleaseMapper.test.ts`
-  - No file means no Release.
-  - Parses an auto-deploy Release.
-  - Parses a pinned Release, keeping only its enabled bindings.
-  - A non-Release file or invalid YAML is treated as absent rather than
-    crashing the form.
-  - The file path matches where Create deployment writes.
-  - Only Kubernetes-style names are accepted, so nothing like `../secrets` can
-    reach the path.
-- `ReleaseVersionMapper.test.ts`: an auto-deploy Release reports
-  `status.autoDeploy.deployedVersion` as its version, or an empty version
-  before the first deploy.
-- `joinDeployments.test.ts`: the auto-deploy flag reaches the deployment card.
-- Render tests:
-  - Auto-deploy Release, with and without a database binding.
-  - Turning auto-deploy off pins the version again.
-  - The Onboard Service dev Release renders as expected.
-  - Onboard Service and Create deployment use the same file name and Release
-    name.
-
-**Form schema check.** The Create deployment parameter schema was compiled
-with ajv 8 (the validator the scaffolder form uses):
-
-```
-VALID   pinned with version
-INVALID pinned, no version            — must have required property 'version'
-INVALID autoDeploy false, no version  — must have required property 'version'
-VALID   autoDeploy on, no version
-```
-
-**Rendering with the real template engine.** Both skeletons, plus the PR
-branch, title and table expressions, were rendered with nunjucks 3.2.4
-configured with `${{ }}` delimiters, the way Backstage's scaffolder runs it.
-This catches nunjucks behaviour the dependency-free render tests can't. All
-output was as intended:
-
-```
-autoDeploy=true  | backstage/deploy-orders-dev-auto     | Enable auto-deploy for orders in dev | auto-deploy: every successful build on `main`
-autoDeploy=false | backstage/deploy-orders-prod-ff5987e | Deploy orders ff5987e to prod        | `ff5987e8395c2fc8f52f3cd078416830244b5019`
-onboard PR "Adds" line, setupAutoDeploy=true:  `platform/registry/orders.yaml` and `platform/environments/dev/orders-release.yaml`.
-onboard PR "Adds" line, setupAutoDeploy=false: `platform/registry/orders.yaml`.
-```
+`backstage-cli package test` runs in watch mode, and never exits, unless
+`CI=true` is set.
 
 ### Not tested here
 
-No real cluster, Argo CD or GitHub was available, so these were **not**
-exercised:
-
-- `goGithubClient.LatestSuccessfulRun` against the real GitHub API. It is a
-  thin wrapper over go-github's `ListWorkflowRunsByFileName`; the tests use a
-  fake.
-- A full scaffolder run in a live Backstage: the form, `fetch:template`
-  conditionals and the PR being opened.
-- Argo CD syncing an auto-deployed commit.
+- The real GitHub API (`LatestSuccessfulRun`, `CompareCommits`): thin
+  wrappers over go-github; the tests use a fake.
+- A live scaffolder run, and Argo CD applying an auto-deployed commit.
 
 Suggested end-to-end check after deploying:
-1. Onboard a test service with "Set up auto deployment to dev" ticked, and
-   merge the PR.
-2. Watch the Release go `AwaitingFirstBuild` → `Synced` once the first
-   `ci.yaml` run on `main` succeeds.
-3. Push a commit and confirm a
-   `Release <name>-dev: auto-deploy <name>/dev <sha>` commit lands in
-   `application-repositories` within about a minute.
-4. Open Create deployment for that service in dev: the toggle should start
-   on.
-5. Switch it off, pick a version, merge, and confirm the operator stops
-   following `main`.
+1. Onboard a test service (auto deployment is on by default) and merge the PR.
+2. Watch its Release go `WaitingForFirstBuild` → an `Auto-deploy <name> <sha7>
+   to dev` commit on the Release file → `Synced`.
+3. Push a commit; within about a minute a new `Auto-deploy` commit moves
+   `version:`, followed by the `components/` commit.
+4. Open Create deployment for it in dev: the toggle starts on.
+5. Turn it off, pick a version, merge: the operator stops moving `version:`.

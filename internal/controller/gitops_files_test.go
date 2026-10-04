@@ -33,7 +33,7 @@ var _ = Describe("GitOps files", func() {
 	}
 
 	It("pins the chart to the same commit as the image", func() {
-		env, err := buildEnvironmentsFile(release, "dev", "https://github.com/entr0pian/payments.git", release.Spec.Version)
+		env, err := buildEnvironmentsFile(release, "dev", "https://github.com/entr0pian/payments.git")
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(env)).To(Equal(`component: payments
 environment: dev
@@ -44,7 +44,7 @@ source:
     chartPath: chart
 `))
 
-		values, err := buildValuesFile(release.Spec.Version, resolvedDatabaseBinding{})
+		values, err := buildValuesFile(release, resolvedDatabaseBinding{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(values)).To(Equal(`image:
     tag: e6fefbea969f8f4a2ce6b4bb87a26dadddb18e7e

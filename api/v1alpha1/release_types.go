@@ -58,19 +58,21 @@ type ReleaseBindings struct {
 	Database *DatabaseBinding `json:"database,omitempty"`
 }
 
-// AutoDeploySpec makes a Release follow its component's main branch instead
-// of a pinned version: every successful CI run on main is deployed as it
-// lands, with no PR per deploy.
+// AutoDeploySpec makes a Release follow a branch of its component's
+// repository: whenever a newer commit on it has a successful CI build, the
+// operator commits that commit as spec.version to this Release's file in
+// application-repositories, and Argo CD applies it like any other change.
 type AutoDeploySpec struct {
-	// enabled turns auto-deploy on. Mutually exclusive with spec.version, and
-	// only honoured in the environments the operator is started with
-	// (--auto-deploy-environments, "dev" by default).
-	// +optional
-	Enabled bool `json:"enabled,omitempty"`
+	// branch is the branch to follow, normally main. Only honoured in the
+	// environments the operator is started with (--auto-deploy-environments,
+	// "dev" by default).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Branch string `json:"branch"`
 }
 
 // ReleaseSpec defines the desired state of Release
-// +kubebuilder:validation:XValidation:rule="(has(self.version) && size(self.version) > 0) != (has(self.autoDeploy) && has(self.autoDeploy.enabled) && self.autoDeploy.enabled)",message="set exactly one of version or autoDeploy.enabled"
+// +kubebuilder:validation:XValidation:rule="has(self.version) || has(self.autoDeploy)",message="set version, autoDeploy, or both"
 type ReleaseSpec struct {
 	// componentRef is the authoritative reference to the owning Component.
 	// +required
@@ -85,14 +87,15 @@ type ReleaseSpec struct {
 	// version is the commit of the component's repository to deploy: used
 	// both as the image tag and as the revision the chart is read from, so
 	// it must be a git ref whose image exists (CI tags images with the full
-	// commit SHA). Required unless autoDeploy.enabled is true, in which case
-	// it must be left unset: the operator picks the version itself.
+	// commit SHA). Optional only with autoDeploy, which sets it (in git)
+	// once the branch has its first successful build, and moves it forward
+	// after that.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	Version string `json:"version,omitempty"`
 
-	// autoDeploy, when enabled, deploys the latest successful CI build on the
-	// component's main branch instead of a pinned version — see AutoDeploySpec.
+	// autoDeploy, when set, keeps version at the newest successfully built
+	// commit on a branch — see AutoDeploySpec.
 	// +optional
 	AutoDeploy *AutoDeploySpec `json:"autoDeploy,omitempty"`
 
@@ -102,26 +105,33 @@ type ReleaseSpec struct {
 	Bindings ReleaseBindings `json:"bindings,omitempty"`
 }
 
-// AutoDeployStatus records what auto-deploy last deployed. It lives in status,
-// never spec: the Release manifest is applied from git by Argo CD, so writing
-// the version back into spec would be reverted (or left OutOfSync).
+// AutoDeployStatus reports what auto-deploy last found, for Backstage to
+// show. Deliberately no timestamp: every status write triggers another
+// reconcile, so a "last checked" time would make an idle Release reconcile
+// itself in a loop.
 type AutoDeployStatus struct {
-	// deployedVersion is the commit SHA last written to application-repositories.
+	// branch is the branch being followed (spec.autoDeploy.branch).
 	// +optional
-	DeployedVersion string `json:"deployedVersion,omitempty"`
+	Branch string `json:"branch,omitempty"`
 
-	// runNumber is the CI workflow run that built deployedVersion. Auto-deploy
-	// only ever moves to a higher run number, never back.
+	// latestDeployable is the newest commit on branch with a successful CI
+	// build, or empty before the first one.
 	// +optional
-	RunNumber int64 `json:"runNumber,omitempty"`
+	LatestDeployable string `json:"latestDeployable,omitempty"`
 
-	// runURL links to that CI run.
+	// runURL links to the CI run that built latestDeployable.
 	// +optional
 	RunURL string `json:"runURL,omitempty"`
 
-	// deployedAt is when deployedVersion was written.
+	// reason is one of UpToDate, Deploying (version committed, waiting for
+	// Argo CD to apply it), WaitingForFirstBuild, NotFastForward,
+	// ReleaseFileNotFound.
 	// +optional
-	DeployedAt *metav1.Time `json:"deployedAt,omitempty"`
+	Reason string `json:"reason,omitempty"`
+
+	// message explains reason.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // ReleaseStatus defines the observed state of Release.
@@ -145,7 +155,7 @@ type ReleaseStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// autoDeploy is set while spec.autoDeploy is enabled — see AutoDeployStatus.
+	// autoDeploy is set while spec.autoDeploy is — see AutoDeployStatus.
 	// +optional
 	AutoDeploy *AutoDeployStatus `json:"autoDeploy,omitempty"`
 }

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -166,6 +167,11 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.Get(ctx, req.NamespacedName, release); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if !release.DeletionTimestamp.IsZero() {
+		// Being deleted (e.g. a teardown removing it from git): writing its
+		// files back now would leave them dangling in application-repositories.
+		return ctrl.Result{}, nil
+	}
 
 	autoDeploy := autoDeployEnabled(release)
 	// waiting is how soon to look again when something isn't ready yet; an
@@ -204,116 +210,59 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return waiting, r.Status().Update(ctx, release)
 	}
 
-	version, run, ready, err := r.resolveVersion(ctx, release, repoURL)
-	if err != nil {
-		r.setReady(release, metav1.ConditionFalse, "VersionResolutionFailed", err.Error())
-		_ = r.Status().Update(ctx, release)
-		return ctrl.Result{}, err
-	}
-	if !ready {
-		return synced, r.Status().Update(ctx, release)
-	}
-	if alreadyDeployed(release, version) {
-		// The common auto-deploy poll: no new build and no spec change since
-		// the last successful sync, so skip reading application-repositories
-		// and keep an idle poll to the one GitHub call above.
-		return synced, nil
-	}
-
-	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL, version)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	valuesContent, err := buildValuesFile(version, dbBinding)
-	if err != nil {
-		return ctrl.Result{}, err
+	if autoDeploy {
+		before := release.Status.DeepCopy()
+		if err := r.runAutoDeploy(ctx, release, repoURL); err != nil {
+			r.setReady(release, metav1.ConditionFalse, "AutoDeployFailed", err.Error())
+			_ = r.Status().Update(ctx, release)
+			return ctrl.Result{}, err
+		}
+		if release.Spec.Version == "" {
+			// Nothing to deploy until a first version is committed and applied.
+			r.setReady(release, metav1.ConditionFalse, release.Status.AutoDeploy.Reason, release.Status.AutoDeploy.Message)
+			return synced, r.Status().Update(ctx, release)
+		}
+		if equality.Semantic.DeepEqual(before, &release.Status) && lastSyncCurrent(release) {
+			// The common poll: no newer build, and spec.version was already
+			// written for this generation. Skip reading application-repositories.
+			return synced, nil
+		}
 	}
 
-	if err := r.syncToGitOps(ctx, release, envContent, valuesContent, run); err != nil {
+	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	valuesContent, err := buildValuesFile(release, dbBinding)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.syncToGitOps(ctx, release, envContent, valuesContent); err != nil {
 		r.setReady(release, metav1.ConditionFalse, "SyncFailed", err.Error())
 		_ = r.Status().Update(ctx, release)
 		return ctrl.Result{}, err
 	}
 
-	if run != nil && (release.Status.AutoDeploy == nil || release.Status.AutoDeploy.DeployedVersion != run.HeadSHA) {
-		log.Info("auto-deployed new version", "component", release.Spec.ComponentRef.Name, "environment", release.Spec.Environment, "version", run.HeadSHA, "run", run.HTMLURL)
-		now := metav1.Now()
-		release.Status.AutoDeploy = &platformv1alpha1.AutoDeployStatus{
-			DeployedVersion: run.HeadSHA,
-			RunNumber:       run.RunNumber,
-			RunURL:          run.HTMLURL,
-			DeployedAt:      &now,
-		}
-	}
-
 	log.Info("release synced", "component", release.Spec.ComponentRef.Name, "environment", release.Spec.Environment)
-	message := "wrote environments/values to application-repositories"
-	if autoDeploy {
-		message = fmt.Sprintf("auto-deploy: %s, from %s", shortSHA(version), release.Status.AutoDeploy.RunURL)
-	}
-	r.setReady(release, metav1.ConditionTrue, "Synced", message)
+	r.setReady(release, metav1.ConditionTrue, "Synced", "wrote environments/values to application-repositories")
 	release.Status.ObservedGeneration = release.Generation
-	// When nothing changed (the common auto-deploy poll), this status is
+	// For an auto-deploy Release with nothing new, this status is
 	// byte-identical to what's stored, so the API server treats the update
 	// as a no-op: no new resourceVersion, no watch event, no reconcile loop.
 	return synced, r.Status().Update(ctx, release)
 }
 
-// resolveVersion returns the commit to deploy. A pinned Release just uses
-// spec.version (run is nil). An auto-deploy Release uses the newest
-// successful CI run on the component's main branch — but never one older
-// than what it already deployed, so a re-run or out-of-order listing can't
-// roll it backwards. ready=false means there's no successful run yet; the
-// condition was set and the caller should poll again, not treat this as an
-// error.
-func (r *ReleaseReconciler) resolveVersion(ctx context.Context, release *platformv1alpha1.Release, repoURL string) (string, *workflowRun, bool, error) {
-	if !autoDeployEnabled(release) {
-		return release.Spec.Version, nil, true, nil
-	}
-
-	owner, repo, err := parseGitHubRepo(repoURL)
-	if err != nil {
-		return "", nil, false, err
-	}
-	gh, _, err := r.githubClientFor(ctx)
-	if err != nil {
-		return "", nil, false, err
-	}
-	latest, err := gh.LatestSuccessfulRun(ctx, owner, repo, ciWorkflowFile, ciBranch)
-	if err != nil {
-		return "", nil, false, err
-	}
-
-	deployed := release.Status.AutoDeploy
-	if latest == nil {
-		if deployed != nil && deployed.DeployedVersion != "" {
-			// Runs can age out of GitHub's listing; keep what's deployed.
-			latest = &workflowRun{HeadSHA: deployed.DeployedVersion, RunNumber: deployed.RunNumber, HTMLURL: deployed.RunURL}
-		} else {
-			r.setReady(release, metav1.ConditionFalse, "AwaitingFirstBuild",
-				fmt.Sprintf("no successful %s run on %s/%s %s yet", ciWorkflowFile, owner, repo, ciBranch))
-			return "", nil, false, nil
-		}
-	}
-	if deployed != nil && deployed.DeployedVersion != "" && latest.RunNumber < deployed.RunNumber {
-		latest = &workflowRun{HeadSHA: deployed.DeployedVersion, RunNumber: deployed.RunNumber, HTMLURL: deployed.RunURL}
-	}
-	return latest.HeadSHA, latest, true, nil
-}
-
-// alreadyDeployed reports whether an auto-deploy Release last synced this
-// exact version for its current spec, with nothing failing since.
-func alreadyDeployed(release *platformv1alpha1.Release, version string) bool {
-	deployed := release.Status.AutoDeploy
+// lastSyncCurrent reports whether the current spec was already synced to
+// application-repositories, with nothing failing since.
+func lastSyncCurrent(release *platformv1alpha1.Release) bool {
 	ready := apimeta.FindStatusCondition(release.Status.Conditions, readyConditionType)
-	return autoDeployEnabled(release) &&
-		deployed != nil && deployed.DeployedVersion == version &&
-		release.Status.ObservedGeneration == release.Generation &&
+	return release.Status.ObservedGeneration == release.Generation &&
 		ready != nil && ready.Status == metav1.ConditionTrue && ready.Reason == "Synced"
 }
 
 func autoDeployEnabled(release *platformv1alpha1.Release) bool {
-	return release.Spec.AutoDeploy != nil && release.Spec.AutoDeploy.Enabled
+	return release.Spec.AutoDeploy != nil && release.Spec.AutoDeploy.Branch != ""
 }
 
 func (r *ReleaseReconciler) autoDeployEnvironments() []string {
@@ -504,9 +453,7 @@ func genericProviderFor(exportProvider string) (string, bool) {
 
 // syncToGitOps commits envContent/valuesContent into application-repositories
 // as one atomic commit, skipping entirely if both files already match.
-// run is the CI run being auto-deployed, or nil for a pinned version; it
-// only changes the commit message.
-func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv1alpha1.Release, envContent, valuesContent []byte, run *workflowRun) error {
+func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv1alpha1.Release, envContent, valuesContent []byte) error {
 	gh, owner, err := r.githubClientFor(ctx)
 	if err != nil {
 		return err
@@ -535,9 +482,6 @@ func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv
 	}
 
 	message := fmt.Sprintf("Release %s: sync %s/%s", release.Name, release.Spec.ComponentRef.Name, release.Spec.Environment)
-	if run != nil {
-		message = fmt.Sprintf("Release %s: auto-deploy %s/%s %s\n\nBuilt by %s", release.Name, release.Spec.ComponentRef.Name, release.Spec.Environment, shortSHA(run.HeadSHA), run.HTMLURL)
-	}
 	if _, err := gh.CommitFiles(ctx, owner, applicationRepositoriesRepo, applicationRepositoriesRef, message, files, headSHA, treeSHA); err != nil {
 		return fmt.Errorf("committing to %s: %w", applicationRepositoriesRepo, err)
 	}
