@@ -41,6 +41,7 @@ type fakeGitHub struct {
 	commits    []fakeCommit
 	latestRun  *workflowRun
 	runQueries []string
+	fileReads  int
 }
 
 type fakeCommit struct {
@@ -53,6 +54,7 @@ func newFakeGitHub() *fakeGitHub {
 }
 
 func (f *fakeGitHub) GetFileContent(_ context.Context, _, _, path, _ string) ([]byte, bool, error) {
+	f.fileReads++
 	content, ok := f.files[path]
 	return content, ok, nil
 }
@@ -245,14 +247,17 @@ var _ = Describe("Auto-deploy", func() {
 		Expect(release.Status.AutoDeploy.DeployedVersion).To(Equal(shaB))
 	})
 
-	It("makes no commit and no status write when nothing changed", func() {
+	It("makes no commit, no file reads and no status write when nothing changed", func() {
 		gh.latestRun = &workflowRun{HeadSHA: shaA, RunNumber: 3, HTMLURL: "https://github.com/entr0pian/orders/actions/runs/3"}
 		key := createRelease("orders-dev-idle", ns, autoDeploy)
 		_, first := reconcileOnce(key)
 
+		readsAfterFirst := gh.fileReads
 		result, second := reconcileOnce(key)
 		Expect(result.RequeueAfter).To(Equal(42 * time.Second))
 		Expect(gh.commits).To(HaveLen(1))
+		Expect(gh.fileReads).To(Equal(readsAfterFirst),
+			"an idle poll must not read application-repositories, only ask GitHub for the latest run")
 		Expect(second.ResourceVersion).To(Equal(first.ResourceVersion),
 			"a poll that finds nothing new must not bump resourceVersion, or the controller would reconcile itself in a loop")
 	})

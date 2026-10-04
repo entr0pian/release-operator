@@ -213,6 +213,12 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if !ready {
 		return synced, r.Status().Update(ctx, release)
 	}
+	if alreadyDeployed(release, version) {
+		// The common auto-deploy poll: no new build and no spec change since
+		// the last successful sync, so skip reading application-repositories
+		// and keep an idle poll to the one GitHub call above.
+		return synced, nil
+	}
 
 	envContent, err := buildEnvironmentsFile(release, release.Namespace, repoURL, version)
 	if err != nil {
@@ -293,6 +299,17 @@ func (r *ReleaseReconciler) resolveVersion(ctx context.Context, release *platfor
 		latest = &workflowRun{HeadSHA: deployed.DeployedVersion, RunNumber: deployed.RunNumber, HTMLURL: deployed.RunURL}
 	}
 	return latest.HeadSHA, latest, true, nil
+}
+
+// alreadyDeployed reports whether an auto-deploy Release last synced this
+// exact version for its current spec, with nothing failing since.
+func alreadyDeployed(release *platformv1alpha1.Release, version string) bool {
+	deployed := release.Status.AutoDeploy
+	ready := apimeta.FindStatusCondition(release.Status.Conditions, readyConditionType)
+	return autoDeployEnabled(release) &&
+		deployed != nil && deployed.DeployedVersion == version &&
+		release.Status.ObservedGeneration == release.Generation &&
+		ready != nil && ready.Status == metav1.ConditionTrue && ready.Reason == "Synced"
 }
 
 func autoDeployEnabled(release *platformv1alpha1.Release) bool {
@@ -455,7 +472,7 @@ func findExport(database *unstructured.Unstructured, name string) (databaseExpor
 		return databaseExport{}, false
 	}
 	for _, raw := range exports {
-		entry, ok := raw.(map[string]interface{})
+		entry, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}

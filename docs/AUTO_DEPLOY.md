@@ -95,13 +95,15 @@ A Release with auto-deploy on requeues every `--auto-deploy-poll-interval`
 `ci.yaml` triggered by a push to `main`.
 
 Why polling rather than webhooks:
-- Webhooks would need a public endpoint on the management cluster, a webhook
-  registered on every service repository, and a way to catch up on missed
-  deliveries.
-- Polling has none of those, and the work is idempotent: a poll that finds
-  nothing new does nothing.
-- A webhook can be added later purely as a speed-up that triggers a
-  reconcile, with polling still the source of truth.
+- A webhook alone can miss deliveries (operator restarting, cluster being
+  rebuilt), so something would have to catch up anyway. Polling is that
+  catch-up, and it is idempotent: a poll that finds nothing new does nothing.
+- Webhooks would also need registering on every service repository, which
+  component-operator would have to do for each new Component.
+- The management cluster already receives GitHub push webhooks for Argo CD
+  (with a shared HMAC secret), so a `workflow_run` webhook that only triggers
+  a reconcile is a small follow-up: it cuts deploy latency, with polling still
+  the source of truth.
 
 Why this exact query:
 - It is the same one Backstage's Create deployment Version picker uses
@@ -111,7 +113,12 @@ Why this exact query:
   `push-image` job has pushed the SHA-tagged image, so the image is guaranteed
   to exist.
 
-Cost: one API call per auto-deploy Release per minute. That's well inside
+Cost: one API call per auto-deploy Release per minute. An idle poll stops
+there: when the newest run is the one already deployed, the spec hasn't
+changed and the last sync succeeded, the operator doesn't read
+`application-repositories` at all. The trade-off is that a hand edit to the
+component's files there isn't reverted until the next build or Release
+change, which is how pinned Releases already behave. That's well inside
 GitHub's 5,000/hour limit for roughly 80 auto-deploy Releases sharing one
 token. Conditional (ETag) requests would make polls nearly free and are a
 possible follow-up.
@@ -132,7 +139,7 @@ Release:
 | Guard | Behaviour | Why |
 |---|---|---|
 | Dev only | `--auto-deploy-environments` (default `dev`). A Release with auto-deploy in any other environment gets `Ready=False, reason=AutoDeployNotAllowed`; nothing is polled or written. | Greying the toggle out in Backstage only stops people using the form. A hand-written PR could still put `autoDeploy` on a prod Release. |
-| Forward only | Never deploy a run with a lower `runNumber` than `status.autoDeploy.runNumber`. | A re-run or an out-of-order listing must not roll dev backwards. |
+| Forward only | Never deploy a run with a lower `runNumber` than `status.autoDeploy.runNumber`. | A re-run or an out-of-order listing must not roll dev backwards. The guard lives in status, so it starts fresh when status is lost (cluster rebuilt, auto-deploy turned off and on). That's harmless: the newest successful run is always the one picked. |
 | No build yet | `Ready=False, reason=AwaitingFirstBuild`, poll again. Not an error. | Right after onboarding, the repository and its first CI run don't exist yet. |
 | Runs aged out | If GitHub lists no runs but one was already deployed, keep it. | A quiet repository shouldn't make the Release regress to "waiting". |
 | No hot loop | A poll that finds nothing new writes a byte-identical status, which the API server treats as a no-op: no new `resourceVersion`, no watch event. | The controller reconciles on every change to the Release. A timestamp written on every poll would make it reconcile itself continuously. |
@@ -199,7 +206,7 @@ repositories, so it should already have it.
 | Warning in the PR when Create deployment would turn auto-deploy off | Rejected | Replaced by the form showing the committed state and allowing only valid combinations. |
 | Roll back on an auto-deploy environment that pins the old version | Rejected | The button is hidden instead, which is simpler. Pinning stays one deliberate step away in Create deployment. |
 | Promote (dev → prod) button | Out of scope | Agreed to keep this change focused. |
-| Webhook trigger | Out of scope | Polling first (see §3). |
+| Webhook trigger | Out of scope | Polling first; a `workflow_run` webhook is the natural speed-up (see §3). |
 
 ## Tests run and results
 
@@ -228,7 +235,7 @@ New specs (all passed):
 | refuses auto-deploy outside the allowed environments, without calling GitHub | `prod` + auto-deploy → `AutoDeployNotAllowed`, no runs queried, no commit, no requeue |
 | waits for the first successful build instead of failing | No run yet → `AwaitingFirstBuild`, requeue after the poll interval, no commit. Queries `entr0pian/orders ci.yaml@main` |
 | deploys the latest successful run directly to application-repositories and records it in status | Run #7 → one commit with the SHA in `values/dev.yaml` and `targetRevision`, commit message links the run, `spec.version` stays empty, `status.autoDeploy` set. Then run #8 → rolls forward. Then run #7 reported again → stays on #8 |
-| makes no commit and no status write when nothing changed | A second poll with the same run → no commit and an **unchanged `resourceVersion`** (no reconcile loop) |
+| makes no commit, no file reads and no status write when nothing changed | A second poll with the same run → no commit, no read of `application-repositories`, and an **unchanged `resourceVersion`** (no reconcile loop) |
 | leaves a pinned Release unchanged: deploys spec.version, never polls, never requeues | Regression check for the existing behaviour |
 | parseGitHubRepo splits a Component clone URL / rejects non-GitHub URLs | URL parsing |
 
