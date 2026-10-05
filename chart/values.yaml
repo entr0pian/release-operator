@@ -104,6 +104,26 @@ manager:
   #   labels: {}
   #   annotations: {}
 
+## GitHub authentication
+##
+github:
+  ## "app": the taskapp-platform-deployer GitHub App, with short-lived
+  ##   installation tokens (one scoped to writing application-repositories,
+  ##   one to reading service repos). Credentials come from Secrets Manager
+  ##   through an ExternalSecret.
+  ## "pat": the shared crossplane-system/crossplane-github-credentials token.
+  ## The operator never falls back from one to the other.
+  ##
+  auth: app
+  ## Account the App is installed on and application-repositories belongs to
+  ##
+  owner: entr0pian
+  app:
+    ## Secrets Manager secret holding appId, installationId and privateKey
+    ##
+    secretPath: taskapp/platform/github-app
+    clusterSecretStoreName: aws-secrets-manager
+
 ## RBAC configuration
 ##
 rbac:

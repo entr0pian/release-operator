@@ -28,6 +28,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -65,6 +66,7 @@ func main() {
 	var enableHTTP2 bool
 	var autoDeployEnvironments string
 	var autoDeployPollInterval time.Duration
+	var githubAuth, githubOwner, githubAppSecret string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -88,6 +90,13 @@ func main() {
 		"Comma-separated environments a Release may enable spec.autoDeploy in. Releases elsewhere are refused.")
 	flag.DurationVar(&autoDeployPollInterval, "auto-deploy-poll-interval", controller.DefaultAutoDeployPollInterval,
 		"How often an auto-deploy Release checks GitHub for a newer successful CI run.")
+	flag.StringVar(&githubAuth, "github-auth", controller.GitHubAuthApp,
+		"How to authenticate to GitHub: \"app\" (GitHub App installation tokens) or \"pat\" "+
+			"(the shared crossplane-system/crossplane-github-credentials token). Never falls back from one to the other.")
+	flag.StringVar(&githubOwner, "github-owner", "",
+		"GitHub account the App is installed on and application-repositories belongs to (app auth only).")
+	flag.StringVar(&githubAppSecret, "github-app-secret", "",
+		"<namespace>/<name> of the Secret holding the GitHub App's appId, installationId and privateKey (app auth only).")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -95,6 +104,18 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	switch githubAuth {
+	case controller.GitHubAuthApp:
+		if githubOwner == "" || !strings.Contains(githubAppSecret, "/") {
+			setupLog.Error(nil, "--github-auth=app needs --github-owner and --github-app-secret=<namespace>/<name>")
+			os.Exit(1)
+		}
+	case controller.GitHubAuthPAT:
+	default:
+		setupLog.Error(nil, "--github-auth must be \"app\" or \"pat\"", "github-auth", githubAuth)
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -187,10 +208,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	var github controller.GitHubClientSource
+	if githubAuth == controller.GitHubAuthApp {
+		namespace, name, _ := strings.Cut(githubAppSecret, "/")
+		secret := types.NamespacedName{Namespace: namespace, Name: name}
+		github = controller.NewGitHubAppSource(mgr.GetAPIReader(), secret, githubOwner)
+	} else {
+		github = controller.NewGitHubPATSource(mgr.GetAPIReader())
+	}
+	setupLog.Info("GitHub authentication", "mode", githubAuth)
+
 	if err := (&controller.ReleaseReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		APIReader: mgr.GetAPIReader(),
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		GitHub: github,
 
 		AutoDeployEnvironments: splitList(autoDeployEnvironments),
 		AutoDeployPollInterval: autoDeployPollInterval,

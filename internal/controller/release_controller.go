@@ -19,13 +19,11 @@ package controller
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -117,17 +115,13 @@ type ReleaseReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// APIReader is a direct, uncached read from the API server
-	// (mgr.GetAPIReader()) — used only for the crossplane-github-credentials
-	// Secret. The cached client.Client lazily starts a cluster-wide
-	// list/watch informer the first time any type is Get'd through it,
-	// which this operator's RBAC (deliberately narrow: get on one named
-	// Secret) doesn't grant. APIReader needs only "get".
-	APIReader client.Reader
-
-	// NewGitHubClient overrides how a githubClient is constructed from a
-	// token, for tests. Defaults to newGoGithubClient.
-	NewGitHubClient func(token string) githubClient
+	// GitHub provides the GitHub client and owner for every API call:
+	// NewGitHubAppSource or NewGitHubPATSource. Both read their Secret
+	// through mgr.GetAPIReader(), a direct, uncached read: the cached
+	// client.Client lazily starts a cluster-wide list/watch informer the
+	// first time any type is Get'd through it, which this operator's RBAC
+	// (deliberately narrow: get on one named Secret) doesn't grant.
+	GitHub GitHubClientSource
 
 	// AutoDeployEnvironments lists the environments a Release may enable
 	// spec.autoDeploy in. Defaults to DefaultAutoDeployEnvironments. This is
@@ -488,38 +482,16 @@ func (r *ReleaseReconciler) syncToGitOps(ctx context.Context, release *platformv
 	return nil
 }
 
-// githubCredentials mirrors the single "credentials" key on the
-// crossplane-github-credentials Secret — a JSON blob, not separate Secret
-// keys (same shape scaffold-operator already reads).
-type githubCredentials struct {
-	Token string `json:"token"`
-	Owner string `json:"owner"`
-}
-
-// githubClientFor reads the shared crossplane-github-credentials Secret via
-// a direct client.Get (Secrets don't mount cross-namespace) and returns a
-// GitHub client plus the account/org this cluster's automation writes as.
+// githubClientFor returns a GitHub client plus the account this cluster's
+// automation writes as, from whichever credentials the operator was started
+// with (see GitHubClientSource). There is deliberately no fallback between
+// them: an operator configured for the GitHub App fails rather than quietly
+// writing with the PAT.
 func (r *ReleaseReconciler) githubClientFor(ctx context.Context) (githubClient, string, error) {
-	secret := &corev1.Secret{}
-	if err := r.APIReader.Get(ctx, types.NamespacedName{Name: credentialsSecretName, Namespace: credentialsSecretNamespace}, secret); err != nil {
-		return nil, "", fmt.Errorf("reading %s/%s credentials secret: %w", credentialsSecretNamespace, credentialsSecretName, err)
+	if r.GitHub == nil {
+		return nil, "", fmt.Errorf("no GitHub credentials configured")
 	}
-
-	raw, ok := secret.Data["credentials"]
-	if !ok {
-		return nil, "", fmt.Errorf("%s/%s secret has no \"credentials\" key", credentialsSecretNamespace, credentialsSecretName)
-	}
-
-	var creds githubCredentials
-	if err := json.Unmarshal(raw, &creds); err != nil {
-		return nil, "", fmt.Errorf("parsing %s/%s credentials: %w", credentialsSecretNamespace, credentialsSecretName, err)
-	}
-
-	newClient := r.NewGitHubClient
-	if newClient == nil {
-		newClient = newGoGithubClient
-	}
-	return newClient(creds.Token), creds.Owner, nil
+	return r.GitHub.clientFor(ctx)
 }
 
 func (r *ReleaseReconciler) setReady(release *platformv1alpha1.Release, status metav1.ConditionStatus, reason, message string) {

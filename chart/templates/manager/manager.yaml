@@ -84,6 +84,11 @@ spec:
         - --metrics-bind-address=0
         {{- end }}
         - --health-probe-bind-address=:8081
+        - --github-auth={{ .Values.github.auth }}
+        {{- if eq .Values.github.auth "app" }}
+        - --github-owner={{ required "github.owner is required for app auth" .Values.github.owner }}
+        - --github-app-secret={{ .Release.Namespace }}/{{ include "release-operator.resourceName" (dict "suffix" "github-app" "context" $) }}
+        {{- end }}
         {{- range .Values.manager.args }}
         - {{ . }}
         {{- end }}

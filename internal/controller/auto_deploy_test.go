@@ -153,8 +153,7 @@ var _ = Describe("Auto-deploy", func() {
 		reconciler = &ReleaseReconciler{
 			Client:                 k8sClient,
 			Scheme:                 k8sClient.Scheme(),
-			APIReader:              k8sClient,
-			NewGitHubClient:        func(string) githubClient { return gh },
+			GitHub:                 &patSource{reader: k8sClient, newClient: func(string) (githubClient, error) { return gh, nil }},
 			AutoDeployPollInterval: 42 * time.Second,
 		}
 	})

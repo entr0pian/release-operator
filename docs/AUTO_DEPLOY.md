@@ -155,13 +155,32 @@ Set them through the chart's `manager.args` if the defaults need changing.
 
 ## Authentication
 
-For now the operator uses the shared `crossplane-system/crossplane-github-credentials`
-PAT (a fine-grained `entr0pian` token), for both the runs query and the commit.
-Service repositories are public, so listing their Actions runs works without
-an explicit Actions permission; a **private** service repo needs
-"Actions: Read-only" on the token. The plan is to move release-operator to a
-GitHub App (`taskapp-deployer`: Contents read/write, Actions read, installed on
-all repositories), with the PAT as a fallback while the App's Secret is absent.
+The operator authenticates as the `taskapp-platform-deployer` GitHub App
+(Contents read/write, Actions read, installed on all `entr0pian`
+repositories); its commits show as `taskapp-platform-deployer[bot]`.
+
+- **Credentials**: App ID, installation ID and private key live in Secrets
+  Manager (`taskapp/platform/github-app`). The chart's ExternalSecret writes
+  them into `release-operator-github-app` in the operator's namespace, and a
+  Role grants `get` on that one Secret only.
+- **Tokens**: `ghinstallation` mints 1-hour installation tokens and renews
+  them itself. The operator holds two, each narrowed below what the App has:
+  `contents: write` on `application-repositories` only (every commit), and
+  `actions: read` + `contents: read` for the service repos (CI runs and the
+  forward-only compare). Clients are rebuilt only when the Secret changes, so
+  a rotated key is picked up without a restart.
+- **No PAT fallback.** `--github-auth=pat` (chart: `github.auth: pat`) still
+  switches the operator to the shared `crossplane-system/crossplane-github-credentials`
+  token for clusters without the App, but the two modes never mix: with
+  `app`, a missing or broken App Secret fails the reconcile instead of
+  quietly writing with the PAT, and the chart doesn't grant access to the
+  PAT's Secret at all.
+
+| Flag | Chart value | Default |
+|---|---|---|
+| `--github-auth` | `github.auth` | `app` |
+| `--github-owner` | `github.owner` | `entr0pian` (chart) |
+| `--github-app-secret` | derived: `<namespace>/<release>-github-app` | — |
 
 ## Backstage
 
