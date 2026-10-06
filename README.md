@@ -1,135 +1,198 @@
 # release-operator
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+Turns a `Release` (`platform.taskapp.io/v1alpha1`), meaning *"component X runs
+version Y in environment Z, with these bindings"*, into the GitOps files Argo CD
+deploys from. It can also keep a dev Release on the newest green build of
+`main` (**auto-deploy**). It runs on the `management` cluster, and its only
+output is commits to
+[`application-repositories`](https://github.com/entr0pian/application-repositories).
 
-## Getting Started
+## Where it fits
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/release-operator:tag
+```mermaid
+flowchart LR
+    BS["Backstage<br/>Create deployment / Onboard Service"] -->|PR| AR
+    subgraph AR["application-repositories"]
+        RF["platform/environments/&lt;env&gt;/<br/>&lt;component&gt;-release.yaml"]
+        CF["components/&lt;component&gt;/<br/>environments/&lt;env&gt;.yaml<br/>values/&lt;env&gt;.yaml"]
+    end
+    RF -->|Argo CD applies| R["Release CR<br/>(management, ns &lt;env&gt;)"]
+    R --> RO["release-operator"]
+    C["Component<br/>(repo URL)"] -.read.-> RO
+    DB["Database<br/>(status.exports)"] -.read.-> RO
+    RO -->|commit| CF
+    CF -->|Argo CD| W["workload on &lt;env&gt; cluster"]
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+People and Backstage write *intent*, the Release file. The operator writes
+the *deployment files*, so nobody edits `components/` by hand. Git stays the
+record of what runs where.
 
-**Install the CRDs into the cluster:**
+## The API
 
-```sh
-make install
+```yaml
+apiVersion: platform.taskapp.io/v1alpha1
+kind: Release
+metadata:
+  name: payments-dev
+  namespace: dev               # one namespace per environment, on management
+spec:
+  componentRef: {name: payments}
+  environment: dev             # matches an Argo CD cluster's environment label
+  version: "<commit sha>"      # image tag AND chart revision
+  autoDeploy: {branch: main}   # optional, dev only; operator moves version
+  bindings:
+    database: {enabled: true, ref: payments-db}   # optional
+status:
+  conditions: [Ready]          # reason: Synced, or why not (below)
+  autoDeploy: {latestDeployable, runURL, reason, message}
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+Set `version`, `autoDeploy`, or both (CEL-validated). `autoDeploy` without a
+`version` is how a service is onboarded before its first build.
 
-```sh
-make deploy IMG=<some-registry>/release-operator:tag
+## What a reconcile does
+
+```mermaid
+flowchart TD
+    A[Release] --> D{being deleted?}
+    D -->|yes| X[write nothing]
+    D -->|no| C["resolve Component<br/>(ns platform) → repo URL"]
+    C --> B["resolve database binding<br/>Database.status.exports → Secrets Manager key"]
+    B --> AD{autoDeploy?}
+    AD -->|yes| AU["auto-deploy step<br/>(may commit a new version to the Release file)"]
+    AD -->|no| G
+    AU --> G["render both components/ files"]
+    G --> S{"differ from git?"}
+    S -->|yes| W["one commit to application-repositories"]
+    S -->|no| N[nothing to write]
+    W --> R["Ready=True, Synced"]
+    N --> R
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+The two files it renders, using `payments` in dev as the example:
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
+```yaml
+# components/payments/environments/dev.yaml       # where the chart comes from
+component: payments
+environment: dev
+namespace: dev
+source:
+  repoURL: https://github.com/entr0pian/payments.git
+  targetRevision: <version>      # chart pinned to the same commit as the image
+  chartPath: chart
+---
+# components/payments/values/dev.yaml              # what changes per deploy
+image:
+  tag: <version>
+bindings:                        # only with an enabled database binding
+  database: {type: secret, provider: aws-secrets-manager, remoteRef: /bindings/dev/databases/payments-db}
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+The chart and the image share one commit, so they always deploy and roll back
+together. The workload's ExternalSecret reads `remoteRef` on its own cluster.
+The Release never handles the credentials themselves.
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+## Auto-deploy
 
-```sh
-kubectl delete -k config/samples/
+```mermaid
+sequenceDiagram
+    participant Dev as developer
+    participant SVC as service repo (CI)
+    participant RO as release-operator
+    participant AR as application-repositories
+    participant ACD as Argo CD
+    Dev->>SVC: push to main
+    SVC->>SVC: ci.yaml builds + pushes image :sha
+    loop every 60s
+        RO->>SVC: newest successful ci.yaml run on main?
+    end
+    RO->>AR: commit 1: Release file version = sha
+    ACD->>RO: applies the Release (spec changed)
+    RO->>AR: commit 2: components/ files (the normal path)
+    ACD->>ACD: sync dev
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+These guards keep it safe:
 
-```sh
-make uninstall
+- **Dev only.** `--auto-deploy-environments` defaults to `dev`, and the
+  operator enforces it, so a hand-written PR can't enable auto-deploy in prod.
+- **Git wins.** Decisions read the Release file from git at a pinned head,
+  and the commit uses that head as its parent. A merged change Argo CD
+  hasn't applied yet is never overwritten.
+- **Forward only.** GitHub's compare API must report the new build as ahead
+  of the current version.
+- **Never creates the file.** A missing Release file sets
+  `ReleaseFileNotFound`, which avoids racing a teardown.
+- **Cheap idle polls.** With nothing new, a poll is one GitHub call and a
+  status write that changes nothing.
+
+Commits are titled `Auto-deploy <component> <sha7> to <env>`, with a link to
+the CI run. `status.autoDeploy.reason` is one of `UpToDate`, `Deploying`,
+`WaitingForFirstBuild`, `NotFastForward` or `ReleaseFileNotFound`. The full
+design rationale is in [`docs/AUTO_DEPLOY.md`](docs/AUTO_DEPLOY.md).
+
+## When it isn't Ready
+
+| Reason | Meaning |
+|---|---|
+| `ComponentNotFound`, `ComponentRepositoryNotReady` | Component missing, or its repo isn't created yet. Retried every 15s. |
+| `DatabaseNotFound`, `ExportMissing`, `ExportNotReady` | Bound Database not there, or not yet published. Retried. |
+| `InvalidSpec`, `ExportTypeUnsupported`, `ExportProviderUnsupported`, `DatabaseBindingInvalid` | Fix the Release or Database spec. |
+| `AutoDeployNotAllowed` | `autoDeploy` set outside the allowed environments. |
+| `AutoDeployFailed`, `SyncFailed` | GitHub call failed. Retried with backoff. |
+
+## GitHub access
+
+The operator authenticates as the **`taskapp-platform-deployer`** GitHub App,
+so its commits show as `taskapp-platform-deployer[bot]`. The App has
+Contents read/write and Actions read, and is installed on all repositories.
+
+```mermaid
+flowchart LR
+    SM[("Secrets Manager<br/>taskapp/platform/github-app")] -->|ExternalSecret| K["Secret in<br/>release-operator-system"]
+    K --> OP["release-operator"]
+    OP -->|"contents:write<br/>application-repositories only"| AR[("application-repositories")]
+    OP -->|"actions:read + contents:read"| SVC[("service repos<br/>CI runs, compare")]
 ```
 
-**UnDeploy the controller from the cluster:**
+- **Tokens:** installation tokens are short-lived and narrowed per use. The
+  clients are rebuilt when the Secret changes, so a rotated key needs no
+  restart.
+- **`--github-auth=pat`:** uses the shared `crossplane-github-credentials`
+  token instead. It exists only for kind-based CI and e2e. The operator
+  never falls back from the App to the PAT.
+
+## Deployment and configuration
+
+CI runs lint, test, e2e and the chart test. When all of them pass, it pushes
+`ghcr.io/entr0pian/release-operator:<sha>`. Then `bump-infra` in
+`application-repositories` pins `infra/release-operator`'s chart and image to
+that same SHA, and Argo CD rolls it out to management. The Helm chart in
+`chart/` is what's deployed; `config/` (kustomize) is only for local and e2e
+deploys.
+
+| Flag | Chart | Default |
+|---|---|---|
+| `--github-auth` | `github.auth` | `app` |
+| `--github-owner` | `github.owner` | `entr0pian` |
+| `--github-app-secret` | set by the chart to its ExternalSecret's target | Secret synced from `github.app.secretPath` (`taskapp/platform/github-app`) |
+| `--auto-deploy-environments` | `manager.args` | `dev` |
+| `--auto-deploy-poll-interval` | `manager.args` | `60s` |
+
+## Development
 
 ```sh
-make undeploy
+make test       # unit + envtest; GitHub is an in-memory fake
+make lint
+make test-e2e   # kind cluster
+go run ./cmd/main.go --github-auth=pat   # against your current kubeconfig
 ```
 
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/release-operator:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/release-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+The API is defined in `api/v1alpha1/`. After changing it, run
+`make manifests generate`, then mirror the new `config/crd/bases` CRD into
+`chart/templates/crd/` (keep its Helm `if` wrapper).
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache 2.0. See the header in any source file.
