@@ -1,11 +1,22 @@
 # release-operator
 
-Turns a `Release` (`platform.taskapp.io/v1alpha1`), meaning *"component X runs
-version Y in environment Z, with these bindings"*, into the GitOps files Argo CD
-deploys from. It can also keep a dev Release on the newest green build of
-`main` (**auto-deploy**). It runs on the `management` cluster, and its only
-output is commits to
-[`application-repositories`](https://github.com/entr0pian/application-repositories).
+A Kubernetes operator that turns a **`Release`** (*"component X runs version Y
+in environment Z, with these bindings"*) into the GitOps files Argo CD deploys
+from. It can also keep dev on the newest green build of `main` without anyone
+opening a PR.
+
+- **GitOps-native.** Its only output is commits to
+  [`application-repositories`](https://github.com/entr0pian/application-repositories).
+  It never touches workloads directly, so git always says what runs where.
+- **Safe auto-deploy.** Dev only, forward only, and it never overwrites a
+  human change.
+- **Least-privilege GitHub access.** It acts as a GitHub App, using
+  short-lived tokens narrowed per call.
+- **Tested against a real API server.** envtest exercises CRD validation
+  and status behaviour, with GitHub replaced by an in-memory fake.
+
+Written in Go with kubebuilder and controller-runtime. It runs on the
+platform's `management` cluster.
 
 ## Where it fits
 
@@ -24,9 +35,9 @@ flowchart LR
     CF -->|Argo CD| W["workload on &lt;env&gt; cluster"]
 ```
 
-People and Backstage write *intent*, the Release file. The operator writes
-the *deployment files*, so nobody edits `components/` by hand. Git stays the
-record of what runs where.
+People and Backstage write the **intent**, which is the Release file. The
+operator writes the **deployment files** derived from it. No one edits
+`components/` by hand.
 
 ## The API
 
@@ -35,63 +46,61 @@ apiVersion: platform.taskapp.io/v1alpha1
 kind: Release
 metadata:
   name: payments-dev
-  namespace: dev               # one namespace per environment, on management
+  namespace: dev               # one namespace per environment
 spec:
   componentRef: {name: payments}
-  environment: dev             # matches an Argo CD cluster's environment label
-  version: "<commit sha>"      # image tag AND chart revision
-  autoDeploy: {branch: main}   # optional, dev only; operator moves version
+  environment: dev             # an Argo CD cluster's environment label
+  version: "<commit sha>"      # image tag and chart revision
+  autoDeploy: {branch: main}   # optional, dev only: the operator moves version
   bindings:
     database: {enabled: true, ref: payments-db}   # optional
 status:
-  conditions: [Ready]          # reason: Synced, or why not (below)
+  conditions: [Ready]
   autoDeploy: {latestDeployable, runURL, reason, message}
 ```
 
-Set `version`, `autoDeploy`, or both (CEL-validated). `autoDeploy` without a
-`version` is how a service is onboarded before its first build.
+`version`, `autoDeploy`, or both must be set; a CEL rule in the CRD enforces
+this. A Release with `autoDeploy` and no `version` is how a new service is
+onboarded before its first build.
 
-## What a reconcile does
+## What it writes
 
 ```mermaid
 flowchart TD
-    A[Release] --> D{being deleted?}
-    D -->|yes| X[write nothing]
-    D -->|no| C["resolve Component<br/>(ns platform) → repo URL"]
-    C --> B["resolve database binding<br/>Database.status.exports → Secrets Manager key"]
+    A[Release] --> C["resolve Component → repo URL"]
+    C --> B["resolve database binding<br/>Database.status.exports → Secrets Manager path"]
     B --> AD{autoDeploy?}
-    AD -->|yes| AU["auto-deploy step<br/>(may commit a new version to the Release file)"]
+    AD -->|yes| AU["auto-deploy step<br/>(may move version, see below)"]
     AD -->|no| G
-    AU --> G["render both components/ files"]
+    AU --> G["render components/ files"]
     G --> S{"differ from git?"}
-    S -->|yes| W["one commit to application-repositories"]
-    S -->|no| N[nothing to write]
-    W --> R["Ready=True, Synced"]
-    N --> R
+    S -->|yes| W["one commit"]
+    S -->|no| N["no-op"]
 ```
 
-The two files it renders, using `payments` in dev as the example:
+For `payments` in dev:
 
 ```yaml
-# components/payments/environments/dev.yaml       # where the chart comes from
+# components/payments/environments/dev.yaml
 component: payments
 environment: dev
 namespace: dev
 source:
   repoURL: https://github.com/entr0pian/payments.git
-  targetRevision: <version>      # chart pinned to the same commit as the image
+  targetRevision: <version>
   chartPath: chart
 ---
-# components/payments/values/dev.yaml              # what changes per deploy
+# components/payments/values/dev.yaml
 image:
   tag: <version>
-bindings:                        # only with an enabled database binding
+bindings:                    # only when a database binding is enabled
   database: {type: secret, provider: aws-secrets-manager, remoteRef: /bindings/dev/databases/payments-db}
 ```
 
-The chart and the image share one commit, so they always deploy and roll back
-together. The workload's ExternalSecret reads `remoteRef` on its own cluster.
-The Release never handles the credentials themselves.
+The chart and the image are pinned to **the same commit**, so they always
+deploy and roll back together. A binding carries only a *path* in Secrets
+Manager. The workload's own ExternalSecret resolves it on its cluster, so
+credentials never pass through the operator or git.
 
 ## Auto-deploy
 
@@ -103,96 +112,105 @@ sequenceDiagram
     participant AR as application-repositories
     participant ACD as Argo CD
     Dev->>SVC: push to main
-    SVC->>SVC: ci.yaml builds + pushes image :sha
+    SVC->>SVC: ci.yaml builds and pushes image :sha
     loop every 60s
         RO->>SVC: newest successful ci.yaml run on main?
     end
-    RO->>AR: commit 1: Release file version = sha
-    ACD->>RO: applies the Release (spec changed)
-    RO->>AR: commit 2: components/ files (the normal path)
+    RO->>AR: commit 1: Release file, version = sha
+    ACD->>RO: applies the updated Release
+    RO->>AR: commit 2: components/ files
     ACD->>ACD: sync dev
 ```
 
-These guards keep it safe:
+The operator moves `version` *in git*, never on the cluster object.
+Every deploy is therefore a reviewable commit, `Auto-deploy payments 85ee7ee to dev`,
+which links its CI run. The guards:
 
-- **Dev only.** `--auto-deploy-environments` defaults to `dev`, and the
-  operator enforces it, so a hand-written PR can't enable auto-deploy in prod.
-- **Git wins.** Decisions read the Release file from git at a pinned head,
-  and the commit uses that head as its parent. A merged change Argo CD
-  hasn't applied yet is never overwritten.
-- **Forward only.** GitHub's compare API must report the new build as ahead
-  of the current version.
-- **Never creates the file.** A missing Release file sets
-  `ReleaseFileNotFound`, which avoids racing a teardown.
-- **Cheap idle polls.** With nothing new, a poll is one GitHub call and a
-  status write that changes nothing.
-
-Commits are titled `Auto-deploy <component> <sha7> to <env>`, with a link to
-the CI run. `status.autoDeploy.reason` is one of `UpToDate`, `Deploying`,
-`WaitingForFirstBuild`, `NotFastForward` or `ReleaseFileNotFound`. The full
-design rationale is in [`docs/AUTO_DEPLOY.md`](docs/AUTO_DEPLOY.md).
-
-## When it isn't Ready
-
-| Reason | Meaning |
+| Guard | How |
 |---|---|
-| `ComponentNotFound`, `ComponentRepositoryNotReady` | Component missing, or its repo isn't created yet. Retried every 15s. |
-| `DatabaseNotFound`, `ExportMissing`, `ExportNotReady` | Bound Database not there, or not yet published. Retried. |
-| `InvalidSpec`, `ExportTypeUnsupported`, `ExportProviderUnsupported`, `DatabaseBindingInvalid` | Fix the Release or Database spec. |
-| `AutoDeployNotAllowed` | `autoDeploy` set outside the allowed environments. |
-| `AutoDeployFailed`, `SyncFailed` | GitHub call failed. Retried with backoff. |
+| Dev only | `--auto-deploy-environments` (default `dev`) is enforced by the operator, not just the UI |
+| Git wins | Reads the Release file at a pinned head and commits with that head as parent, so a concurrent merge makes the commit fail instead of being overwritten |
+| Forward only | GitHub's compare API must report the new build *ahead* of the current version |
+| Never creates files | A missing Release file means it was removed on purpose: `ReleaseFileNotFound` |
+| Cheap when idle | A poll with nothing new is one GitHub call and a status write the API server drops as a no-op |
+
+`status.autoDeploy.reason` reports the outcome: `UpToDate`, `Deploying`,
+`WaitingForFirstBuild`, `NotFastForward` or `ReleaseFileNotFound`.
 
 ## GitHub access
 
 The operator authenticates as the **`taskapp-platform-deployer`** GitHub App,
-so its commits show as `taskapp-platform-deployer[bot]`. The App has
-Contents read/write and Actions read, and is installed on all repositories.
+so its commits appear as `taskapp-platform-deployer[bot]`.
 
 ```mermaid
 flowchart LR
-    SM[("Secrets Manager<br/>taskapp/platform/github-app")] -->|ExternalSecret| K["Secret in<br/>release-operator-system"]
+    SM[("AWS Secrets Manager")] -->|External Secrets| K["App credentials Secret"]
     K --> OP["release-operator"]
     OP -->|"contents:write<br/>application-repositories only"| AR[("application-repositories")]
-    OP -->|"actions:read + contents:read"| SVC[("service repos<br/>CI runs, compare")]
+    OP -->|"actions:read, contents:read"| SVC[("service repos")]
 ```
 
-- **Tokens:** installation tokens are short-lived and narrowed per use. The
-  clients are rebuilt when the Secret changes, so a rotated key needs no
-  restart.
-- **`--github-auth=pat`:** uses the shared `crossplane-github-credentials`
-  token instead. It exists only for kind-based CI and e2e. The operator
-  never falls back from the App to the PAT.
+- **Tokens.** Installation tokens live for an hour, and each is scoped
+  below what the App itself can do.
+- **Key rotation.** A rotated key is picked up without a restart.
+- **PAT mode.** `--github-auth=pat` exists only for kind-based CI. The
+  operator never falls back from the App to a PAT.
 
-## Deployment and configuration
+## Design choices
 
-CI runs lint, test, e2e and the chart test. When all of them pass, it pushes
-`ghcr.io/entr0pian/release-operator:<sha>`. Then `bump-infra` in
-`application-repositories` pins `infra/release-operator`'s chart and image to
-that same SHA, and Argo CD rolls it out to management. The Helm chart in
-`chart/` is what's deployed; `config/` (kustomize) is only for local and e2e
-deploys.
+- **Write git, not the cluster.** Patching `spec.version` on the cluster would
+  be reverted by Argo CD's self-heal, and git would no longer record what runs.
+- **Two commits per auto-deploy.** Each file kind has exactly one writer. The
+  Release file is written by people or by auto-deploy, and `components/` only
+  by the reconcile that follows. Argo CD's push webhooks keep the gap to
+  seconds.
+- **The operator writes the GitOps repo, not service CI.** This keeps write
+  access to `application-repositories` out of every service repository.
+- **Polling, not webhooks.** A 60s poll survives operator restarts and
+  cluster rebuilds without any catch-up logic.
+- **Foreign types read as unstructured.** `Component` and `Database` belong
+  to other projects, and the operator doesn't vendor their Go types.
 
-| Flag | Chart | Default |
+## Status
+
+`Ready=True` (`Synced`) means the files in git match the Release. Otherwise
+the reason says why:
+
+| Reason | Meaning |
+|---|---|
+| `ComponentNotFound`, `ComponentRepositoryNotReady` | Component or its repo isn't there yet. Retries every 15s. |
+| `DatabaseNotFound`, `ExportMissing`, `ExportNotReady` | Bound Database not ready yet. Retries every 15s. |
+| `InvalidSpec`, `ExportTypeUnsupported`, `ExportProviderUnsupported` | The Release or Database spec needs fixing. |
+| `AutoDeployNotAllowed` | `autoDeploy` set outside the allowed environments. |
+| `AutoDeployFailed`, `SyncFailed` | A GitHub call failed. Retries with backoff. |
+
+## Delivery
+
+Every push runs lint, unit/envtest, e2e on kind, and a Helm install test. On
+`main`, once all of them pass, CI pushes `ghcr.io/entr0pian/release-operator:<sha>`.
+Then the shared `bump-infra` workflow pins this operator's chart *and* image
+to that SHA in `application-repositories`, and Argo CD rolls it out. The
+operator ships through the same GitOps path it implements for services.
+
+| Flag | Default | |
 |---|---|---|
-| `--github-auth` | `github.auth` | `app` |
-| `--github-owner` | `github.owner` | `entr0pian` |
-| `--github-app-secret` | set by the chart to its ExternalSecret's target | Secret synced from `github.app.secretPath` (`taskapp/platform/github-app`) |
-| `--auto-deploy-environments` | `manager.args` | `dev` |
-| `--auto-deploy-poll-interval` | `manager.args` | `60s` |
+| `--github-auth` | `app` | chart `github.auth` |
+| `--github-owner` | `entr0pian` | chart `github.owner` |
+| `--auto-deploy-environments` | `dev` | via `manager.args` |
+| `--auto-deploy-poll-interval` | `60s` | via `manager.args` |
 
 ## Development
 
 ```sh
-make test       # unit + envtest; GitHub is an in-memory fake
+make test       # unit + envtest
 make lint
 make test-e2e   # kind cluster
-go run ./cmd/main.go --github-auth=pat   # against your current kubeconfig
+go run ./cmd/main.go --github-auth=pat   # against the current kubeconfig
 ```
 
-The API is defined in `api/v1alpha1/`. After changing it, run
-`make manifests generate`, then mirror the new `config/crd/bases` CRD into
-`chart/templates/crd/` (keep its Helm `if` wrapper).
+The API lives in `api/v1alpha1/`. After changing it, run
+`make manifests generate` and mirror the CRD into `chart/templates/crd/`.
 
 ## License
 
-Apache 2.0. See the header in any source file.
+Apache 2.0.
